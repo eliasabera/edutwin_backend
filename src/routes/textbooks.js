@@ -1,0 +1,22 @@
+const express = require("express");
+const auth = require("../middleware/auth");
+const roleCheck = require("../middleware/roleCheck");
+const {
+	createTextbook,
+	getTextbooks,
+	getTextbookById,
+	updateTextbook,
+	deleteTextbook,
+	addInteractiveMetadata,
+} = require("../controllers/textbookController");
+
+const router = express.Router();
+
+router.get("/", auth, getTextbooks);
+router.get("/:textbookId", auth, getTextbookById);
+router.post("/", auth, roleCheck("ADMIN", "TEACHER"), createTextbook);
+router.put("/:textbookId", auth, roleCheck("ADMIN", "TEACHER"), updateTextbook);
+router.delete("/:textbookId", auth, roleCheck("ADMIN", "TEACHER"), deleteTextbook);
+router.post("/:textbookId/metadata", auth, roleCheck("ADMIN", "TEACHER"), addInteractiveMetadata);
+
+module.exports = router;
