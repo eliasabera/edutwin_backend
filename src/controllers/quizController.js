@@ -1,10 +1,136 @@
 const mongoose = require("mongoose");
-const { Quiz, QuizAssignment, Question, QuizAttempt, StudentAnswer, TeacherProfile } = require("../models");
+const axios = require("axios");
+const { Quiz, QuizAssignment, Question, QuizAttempt, StudentAnswer, TeacherProfile, Subject, StudentProfile } = require("../models");
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 const isTransactionUnsupportedError = (error) => {
 	const message = String(error?.message || "");
 	return message.includes("Transaction numbers are only allowed") || message.includes("replica set");
+};
+const AI_SERVICE_BASE_URL = process.env.AI_SERVICE_BASE_URL || "http://127.0.0.1:8000";
+
+const normalizeAiQuestionType = (value) => {
+	const raw = String(value || "").trim().toUpperCase().replace(/-/g, "_");
+	if (raw === "MCQ") return "MCQ";
+	if (raw === "TRUE_FALSE" || raw === "TRUEFALSE") return "TRUE_FALSE";
+	if (raw === "SHORT" || raw === "SHORT_ANSWER") return "SHORT_ANSWER";
+	return null;
+};
+
+const toNumericGrade = (value) => {
+	const n = Number(value);
+	return Number.isFinite(n) && n > 0 ? Math.trunc(n) : null;
+};
+
+const resolveStudentProfileForRequest = async (req, body = {}) => {
+	if (body.student_id && isValidId(body.student_id)) {
+		const profile = await StudentProfile.findById(body.student_id);
+		if (profile) return profile;
+	}
+
+	if (req.user?.id && isValidId(req.user.id)) {
+		const profile = await StudentProfile.findOne({ user_id: req.user.id });
+		if (profile) return profile;
+	}
+
+	return null;
+};
+
+const resolveSubjectForRequest = async (body = {}) => {
+	if (body.subject_id && isValidId(body.subject_id)) {
+		const byId = await Subject.findById(body.subject_id);
+		if (byId) return byId;
+	}
+
+	if (typeof body.subject === "string" && body.subject.trim()) {
+		const subjectName = body.subject.trim();
+		const existing = await Subject.findOne({ name: new RegExp(`^${subjectName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
+		if (existing) return existing;
+
+		const gradeLevel = toNumericGrade(body.grade) || 1;
+		return Subject.create({ name: subjectName, grade_level: gradeLevel });
+	}
+
+	return null;
+};
+
+const normalizeQuestionsPayload = (questions = []) =>
+	Array.isArray(questions)
+		? questions.map((q, index) => ({
+				question_type: q.question_type,
+				question_text: q.question_text,
+				options:
+					q.question_type === "TRUE_FALSE"
+						? q.options || ["TRUE", "FALSE"]
+						: Array.isArray(q.options)
+							? q.options
+							: undefined,
+				correct_answer: q.correct_answer,
+				points: q.points !== undefined ? Number(q.points) : 1,
+				order_index: q.order_index !== undefined ? Number(q.order_index) : index + 1,
+				hint: q.hint || null,
+				explanation: q.explanation,
+		  }))
+		: [];
+
+const persistQuizWithQuestions = async (quizPayload, normalizedQuestions) => {
+	let quiz = null;
+	let createdQuestions = [];
+
+	const session = await mongoose.startSession();
+	try {
+		await session.withTransaction(async () => {
+			const createdQuiz = await Quiz.create([quizPayload], { session });
+			quiz = createdQuiz[0];
+
+			if (normalizedQuestions.length > 0) {
+				createdQuestions = await Question.insertMany(
+					normalizedQuestions.map((q) => ({
+						quiz_id: quiz._id,
+						question_type: q.question_type,
+						question_text: q.question_text,
+						options: q.options,
+						correct_answer: q.correct_answer,
+						points: q.points,
+						order_index: q.order_index,
+						hint: q.hint,
+						explanation: q.explanation,
+					})),
+					{ session }
+				);
+			}
+		});
+	} catch (txError) {
+		if (!isTransactionUnsupportedError(txError)) {
+			throw txError;
+		}
+
+		quiz = await Quiz.create(quizPayload);
+		try {
+			if (normalizedQuestions.length > 0) {
+				createdQuestions = await Question.insertMany(
+					normalizedQuestions.map((q) => ({
+						quiz_id: quiz._id,
+						question_type: q.question_type,
+						question_text: q.question_text,
+						options: q.options,
+						correct_answer: q.correct_answer,
+						points: q.points,
+						order_index: q.order_index,
+						hint: q.hint,
+						explanation: q.explanation,
+					}))
+				);
+			}
+		} catch (questionError) {
+			await Quiz.findByIdAndDelete(quiz._id);
+			throw questionError;
+		}
+	} finally {
+		await session.endSession();
+	}
+
+	return { quiz, createdQuestions };
 };
 
 const createQuiz = async (req, res) => {
@@ -58,23 +184,7 @@ const createQuiz = async (req, res) => {
 			}
 		}
 
-		const normalizedQuestions = Array.isArray(questions)
-			? questions.map((q, index) => ({
-					question_type: q.question_type,
-					question_text: q.question_text,
-					options:
-						q.question_type === "TRUE_FALSE"
-							? q.options || ["TRUE", "FALSE"]
-							: Array.isArray(q.options)
-								? q.options
-								: undefined,
-					correct_answer: q.correct_answer,
-					points: q.points !== undefined ? Number(q.points) : 1,
-					order_index: q.order_index !== undefined ? Number(q.order_index) : index + 1,
-					hint: q.hint || null,
-					explanation: q.explanation,
-				}))
-			: [];
+		const normalizedQuestions = normalizeQuestionsPayload(questions);
 
 		const calculatedTotalPossible = normalizedQuestions.reduce((sum, q) => sum + Number(q.points || 0), 0);
 		const quizPayload = {
@@ -91,66 +201,132 @@ const createQuiz = async (req, res) => {
 				total_score_possible !== undefined ? Number(total_score_possible) : calculatedTotalPossible,
 		};
 
-		let quiz = null;
-		let createdQuestions = [];
-
-		const session = await mongoose.startSession();
-		try {
-			await session.withTransaction(async () => {
-				const createdQuiz = await Quiz.create([quizPayload], { session });
-				quiz = createdQuiz[0];
-
-				if (normalizedQuestions.length > 0) {
-					createdQuestions = await Question.insertMany(
-						normalizedQuestions.map((q) => ({
-							quiz_id: quiz._id,
-							question_type: q.question_type,
-							question_text: q.question_text,
-							options: q.options,
-							correct_answer: q.correct_answer,
-							points: q.points,
-							order_index: q.order_index,
-							hint: q.hint,
-							explanation: q.explanation,
-						})),
-						{ session }
-					);
-				}
-			});
-		} catch (txError) {
-			if (!isTransactionUnsupportedError(txError)) {
-				throw txError;
-			}
-
-			// Fallback for standalone MongoDB where transactions are not supported.
-			quiz = await Quiz.create(quizPayload);
-			try {
-				if (normalizedQuestions.length > 0) {
-					createdQuestions = await Question.insertMany(
-						normalizedQuestions.map((q) => ({
-							quiz_id: quiz._id,
-							question_type: q.question_type,
-							question_text: q.question_text,
-							options: q.options,
-							correct_answer: q.correct_answer,
-							points: q.points,
-							order_index: q.order_index,
-							hint: q.hint,
-							explanation: q.explanation,
-						}))
-					);
-				}
-			} catch (questionError) {
-				await Quiz.findByIdAndDelete(quiz._id);
-				throw questionError;
-			}
-		} finally {
-			await session.endSession();
-		}
+		const { quiz, createdQuestions } = await persistQuizWithQuestions(quizPayload, normalizedQuestions);
 
 		return res.status(201).json({ success: true, message: "Quiz created", data: { quiz, questions: createdQuestions } });
 	} catch (error) {
 		return res.status(500).json({ success: false, message: "Failed to create quiz", error: error.message });
+	}
+};
+
+const generateAiPracticeQuiz = async (req, res) => {
+	try {
+		const {
+			subject,
+			subject_id,
+			topic,
+			num_questions,
+			types,
+			grade,
+			student_profile,
+			title,
+			status,
+			duration_minutes,
+			passing_score,
+		} = req.body;
+
+		const subjectDoc = await resolveSubjectForRequest({ subject, subject_id, grade });
+		if (!subjectDoc) {
+			return res.status(400).json({
+				success: false,
+				message: "subject or valid subject_id is required",
+			});
+		}
+
+		const studentProfile = await resolveStudentProfileForRequest(req, req.body);
+		if (req.user?.role === "STUDENT" && !studentProfile) {
+			return res.status(400).json({
+				success: false,
+				message: "Student profile is required to generate and save practice quizzes",
+			});
+		}
+
+		const aiPayload = {
+			subject: subject || subjectDoc.name,
+			topic: topic || subjectDoc.name,
+			num_questions: Number(num_questions) > 0 ? Number(num_questions) : 5,
+			types: Array.isArray(types) && types.length > 0 ? types : ["mcq", "true_false", "short"],
+			grade: grade || studentProfile?.grade_level || subjectDoc.grade_level || 9,
+			student_profile:
+				student_profile ||
+				(studentProfile
+					? {
+						full_name: studentProfile.full_name,
+						grade: String(studentProfile.grade_level || grade || 9),
+					}
+					: undefined),
+		};
+
+		const { data } = await axios.post(`${AI_SERVICE_BASE_URL}/practice`, aiPayload, { timeout: 60000 });
+		const aiQuestions = Array.isArray(data?.questions) ? data.questions : [];
+
+		if (aiQuestions.length === 0) {
+			return res.status(422).json({
+				success: false,
+				message: data?.error || "AI did not return practice questions",
+				data: { raw: data || null },
+			});
+		}
+
+		const normalizedQuestions = normalizeQuestionsPayload(
+			aiQuestions
+				.map((q, index) => ({
+					question_type: normalizeAiQuestionType(q.type),
+					question_text: q.question,
+					options:
+						normalizeAiQuestionType(q.type) === "TRUE_FALSE"
+							? ["TRUE", "FALSE"]
+							: Array.isArray(q.options)
+								? q.options
+								: [],
+					correct_answer: q.answer,
+					explanation: q.explanation,
+					points: 1,
+					order_index: index + 1,
+					hint: null,
+				}))
+				.filter((q) => q.question_type && q.question_text && q.correct_answer !== undefined && q.explanation)
+		);
+
+		if (normalizedQuestions.length === 0) {
+			return res.status(422).json({
+				success: false,
+				message: "AI response did not contain valid quiz question format",
+				data: { raw: data || null },
+			});
+		}
+
+		const calculatedTotalPossible = normalizedQuestions.reduce((sum, q) => sum + Number(q.points || 0), 0);
+		const quizPayload = {
+			subject_id: subjectDoc._id,
+			creator_type: "AI",
+			teacher_id: null,
+			student_id: studentProfile?._id || null,
+			topic: topic || subjectDoc.name,
+			title: title || `${String(subjectDoc.name).toUpperCase()} AI Practice`,
+			status: status || "DRAFT",
+			duration_minutes: duration_minutes || null,
+			passing_score: passing_score || null,
+			total_score_possible: calculatedTotalPossible,
+		};
+
+		const { quiz, createdQuestions } = await persistQuizWithQuestions(quizPayload, normalizedQuestions);
+
+		return res.status(201).json({
+			success: true,
+			message: "AI practice quiz generated",
+			data: {
+				quiz,
+				questions: createdQuestions,
+				ai_meta: {
+					subject: aiPayload.subject,
+					topic: aiPayload.topic,
+					num_questions: normalizedQuestions.length,
+				},
+			},
+		});
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to generate AI practice quiz", error: error.message });
 	}
 };
 
@@ -233,6 +409,42 @@ const getMyCreatedQuizzes = async (req, res) => {
 	}
 };
 
+const getMyPracticeQuizzes = async (req, res) => {
+	try {
+		if (!req.user?.id || !isValidId(req.user.id)) {
+			return res.status(401).json({ success: false, message: "Unauthorized" });
+		}
+
+		const studentProfile = await StudentProfile.findOne({ user_id: req.user.id }).select("_id");
+		if (!studentProfile) {
+			return res.status(200).json({ success: true, data: [] });
+		}
+
+		const quizzes = await Quiz.find({
+			creator_type: "AI",
+			student_id: studentProfile._id,
+		})
+			.sort({ created_at: -1 })
+			.lean();
+
+		const quizIds = quizzes.map((item) => item._id);
+		const counts = await Question.aggregate([
+			{ $match: { quiz_id: { $in: quizIds } } },
+			{ $group: { _id: "$quiz_id", count: { $sum: 1 } } },
+		]);
+		const countMap = new Map(counts.map((item) => [String(item._id), item.count]));
+
+		const data = quizzes.map((item) => ({
+			...item,
+			question_count: countMap.get(String(item._id)) || 0,
+		}));
+
+		return res.status(200).json({ success: true, data });
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to fetch practice quizzes", error: error.message });
+	}
+};
+
 const submitQuizAttempt = async (req, res) => {
 	try {
 		const { quiz_id, student_id, answers } = req.body;
@@ -310,5 +522,7 @@ module.exports = {
 	getAssignedQuizzesForClass,
 	getQuizById,
 	getMyCreatedQuizzes,
+	getMyPracticeQuizzes,
 	submitQuizAttempt,
+	generateAiPracticeQuiz,
 };
