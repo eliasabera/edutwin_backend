@@ -235,6 +235,44 @@ class PracticeRequest(BaseModel):
     student_profile: Optional[StudentProfile] = None
 
 
+class TextbookAssistRequest(BaseModel):
+    subject: str = "physics"
+    grade: str = DEFAULT_GRADE
+    chapter: Optional[str] = None
+    unit: Optional[str] = None
+    current_page: Optional[int] = None
+    current_topic: Optional[str] = None
+    current_passage: Optional[str] = None
+
+
+class TextSelectionAskRequest(BaseModel):
+    subject: str = "physics"
+    grade: str = DEFAULT_GRADE
+    chapter: Optional[str] = None
+    unit: Optional[str] = None
+    question: str
+    selected_text: str
+    full_name: Optional[str] = None
+    current_page: Optional[int] = None
+    current_topic: Optional[str] = None
+    support_subjects: Optional[list[str]] = None
+    strong_subjects: Optional[list[str]] = None
+    mastery_score: Optional[float] = None
+    performance_band: Optional[str] = None
+
+
+class TextbookResourcesRequest(BaseModel):
+    subject: str = "physics"
+    grade: str = DEFAULT_GRADE
+    chapter: Optional[str] = None
+    unit: Optional[str] = None
+
+
+CANVAS_KEYS = ("canvas_url", "canvas_link", "model_url", "demo_url", "canvasModelLink")
+AR_KEYS = ("ar_model_url", "ar_url", "figure_ar_url")
+TEXTBOOK_URL_KEYS = ("textbook_url", "book_url", "pdf_url", "source_url")
+
+
 def get_client():
     global client
     if client is None:
@@ -425,6 +463,198 @@ def normalize_subject_name(subject: Optional[str]):
         if lowered == canonical_subject or lowered in aliases:
             return canonical_subject
     return None
+
+
+def metadata_page(metadata: dict):
+    for key in ("page", "page_number", "page_no", "page_index", "pageIndex"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, int):
+            return value
+        match = re.search(r"\d+", str(value))
+        if match:
+            return int(match.group(0))
+    return None
+
+
+def first_non_empty(metadata: dict, keys: tuple[str, ...]):
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def collection_rows(subject: str, grade: str, unit: Optional[str] = None):
+    collections = get_client().list_collections()
+    if not collections:
+        return []
+
+    name = getattr(collections[0], "name", collections[0])
+    collection = get_client().get_collection(name)
+    result = collection.get(include=["documents", "metadatas"])
+
+    docs = result.get("documents") or []
+    metas = result.get("metadatas") or []
+
+    wanted_subject = normalize_grounded_answer(subject).lower()
+    wanted_grade = normalize_grade_value(grade)
+    wanted_unit = normalize_grounded_answer(unit).lower() if unit else ""
+
+    rows = []
+    for idx, doc in enumerate(docs):
+        metadata = metas[idx] if idx < len(metas) and isinstance(metas[idx], dict) else {}
+        row_subject = normalize_grounded_answer(str(metadata.get("subject", ""))).lower()
+        row_grade = normalize_grade_value(str(metadata.get("grade", wanted_grade)))
+        row_unit = normalize_grounded_answer(str(metadata.get("unit", ""))).lower()
+
+        if wanted_subject and row_subject and row_subject != wanted_subject:
+            continue
+        if wanted_grade and row_grade and row_grade != wanted_grade:
+            continue
+        if wanted_unit and row_unit and row_unit != wanted_unit:
+            continue
+
+        rows.append({"document": normalize_grounded_answer(str(doc or "")), "metadata": metadata})
+    return rows
+
+
+def rank_rows(query: str, rows: list[dict]):
+    tokens = set(re.findall(r"[a-zA-Z0-9]{3,}", normalize_grounded_answer(query).lower()))
+    if not tokens:
+        return rows[:TOP_K]
+
+    scored = []
+    for row in rows:
+        text_tokens = set(re.findall(r"[a-zA-Z0-9]{3,}", row["document"].lower()))
+        score = len(tokens.intersection(text_tokens))
+        scored.append((score, row))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    ranked = [row for score, row in scored if score > 0]
+    return (ranked or [row for _, row in scored])[:TOP_K]
+
+
+def find_canvas_for_page(rows: list[dict], page: Optional[int]):
+    if page is None or page <= 0:
+        return {
+            "show_canvas_suggestion": False,
+            "topic": None,
+            "canvas_link": None,
+            "suggestion_text": None,
+            "matched_page": page,
+        }
+
+    exact = []
+    nearby = []
+    for row in rows:
+        row_page = metadata_page(row.get("metadata", {}))
+        if row_page is None:
+            continue
+        if row_page == page:
+            exact.append(row)
+        elif abs(row_page - page) <= 1:
+            nearby.append(row)
+
+    for bucket in (exact, nearby):
+        for row in bucket:
+            link = first_non_empty(row.get("metadata", {}), CANVAS_KEYS)
+            if link:
+                row_page = metadata_page(row.get("metadata", {}))
+                return {
+                    "show_canvas_suggestion": True,
+                    "topic": f"page {row_page}",
+                    "canvas_link": link,
+                    "suggestion_text": f"Do you want to see the canvas model for page {row_page}?",
+                    "matched_page": row_page,
+                }
+
+    return {
+        "show_canvas_suggestion": False,
+        "topic": None,
+        "canvas_link": None,
+        "suggestion_text": None,
+        "matched_page": page,
+    }
+
+
+def find_ar_for_page(rows: list[dict], page: Optional[int]):
+    if page is None or page <= 0:
+        return {
+            "show_ar_suggestion": False,
+            "ar_model_url": None,
+            "ar_suggestion_text": None,
+        }
+
+    for row in rows:
+        row_page = metadata_page(row.get("metadata", {}))
+        if row_page != page:
+            continue
+        ar_link = first_non_empty(row.get("metadata", {}), AR_KEYS)
+        if ar_link:
+            return {
+                "show_ar_suggestion": True,
+                "ar_model_url": ar_link,
+                "ar_suggestion_text": f"Tap the figure on page {page} to open AR model.",
+            }
+
+    return {
+        "show_ar_suggestion": False,
+        "ar_model_url": None,
+        "ar_suggestion_text": None,
+    }
+
+
+def extract_textbook_resources(rows: list[dict]):
+    resources = []
+    seen = set()
+
+    for row in rows:
+        metadata = row.get("metadata", {}) if isinstance(row, dict) else {}
+        page = metadata_page(metadata)
+        chapter = first_non_empty(metadata, ("chapter", "chapter_name", "unit")) or "General"
+        topic = first_non_empty(metadata, ("topic", "subtopic", "section", "title")) or (
+            f"Page {page}" if page else "General"
+        )
+
+        canvas_link = first_non_empty(metadata, CANVAS_KEYS)
+        ar_link = first_non_empty(metadata, AR_KEYS)
+
+        if canvas_link:
+            key = ("canvas", canvas_link)
+            if key not in seen:
+                seen.add(key)
+                resources.append(
+                    {
+                        "id": f"canvas-{len(resources) + 1}",
+                        "chapter": str(chapter),
+                        "topic": str(topic),
+                        "title": f"{topic} Canvas Model",
+                        "type": "canvas",
+                        "url": canvas_link,
+                        "page": page,
+                    }
+                )
+
+        if ar_link:
+            key = ("ar", ar_link)
+            if key not in seen:
+                seen.add(key)
+                resources.append(
+                    {
+                        "id": f"ar-{len(resources) + 1}",
+                        "chapter": str(chapter),
+                        "topic": str(topic),
+                        "title": f"{topic} AR Model",
+                        "type": "ar",
+                        "url": ar_link,
+                        "page": page,
+                    }
+                )
+
+    resources.sort(key=lambda item: (item.get("chapter", ""), item.get("topic", ""), item.get("type", "")))
+    return resources
 
 
 def detect_subject(text: str):
@@ -1318,6 +1548,51 @@ def sanitize_tutor_response(raw_text: str, question: str):
     return cleaned or "I could not generate a clean textbook-based answer right now."
 
 
+def sanitize_selection_response(raw_text: str):
+    cleaned = normalize_grounded_answer(raw_text or "")
+    if not cleaned:
+        return "I could not generate a clear answer from the selected text."
+
+    cleaned = re.sub(r"\*+", "", cleaned)
+    cleaned = re.sub(r"#+", "", cleaned)
+
+    # Drop common structured tails that appear in tutor-mode output.
+    cleaned = re.split(
+        r"\b(?:Example|Examples|Summary|Practice\s*Question|Activity(?:\s*\d+)?)\s*:",
+        cleaned,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+
+    # Remove greeting with student name from the start (e.g., "Hey Abel, ...").
+    cleaned = re.sub(
+        r"^(?:hey|hello|hi)\s+[a-zA-Z][a-zA-Z'\- ]{0,30}[,.!?]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalize markdown-like list prefixes.
+    cleaned = re.sub(r"(?:^|\s)[\-•]+\s*", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or "I could not generate a clear answer from the selected text."
+
+
+def is_selection_direct_answer_request(question: str):
+    lowered = normalize_match_text(question)
+    direct_markers = [
+        "answer this question",
+        "final answer",
+        "choose the correct",
+        "which option",
+        "mcq",
+        "multiple choice",
+        "true or false",
+        "only answer",
+    ]
+    return any(marker in lowered for marker in direct_markers)
+
+
 def add_student_intro(answer: str, profile: StudentProfile, question: str):
     cleaned_answer = normalize_grounded_answer(answer)
     if not cleaned_answer:
@@ -1598,6 +1873,191 @@ def generate_practice_logic(subject_name: Optional[str], topic: str, num_questio
 @app.get("/")
 def home():
     return {"status": "EduTwin Brain is Active"}
+
+
+@app.get("/textbook/info")
+def textbook_info():
+    rows = collection_rows("physics", DEFAULT_GRADE)
+    textbook_url = None
+    for row in rows:
+        textbook_url = first_non_empty(row.get("metadata", {}), TEXTBOOK_URL_KEYS)
+        if textbook_url:
+            break
+
+    return {
+        "subject": "physics",
+        "grade": DEFAULT_GRADE,
+        "unit": None,
+        "chapter": None,
+        "textbook_url": textbook_url,
+    }
+
+
+@app.post("/textbook/resources")
+def textbook_resources(req: TextbookResourcesRequest):
+    normalized_subject = normalize_subject_name(req.subject) or "physics"
+    normalized_grade = normalize_grade_value(req.grade)
+    rows = collection_rows(normalized_subject, normalized_grade, req.unit)
+    resources = extract_textbook_resources(rows)
+    return {
+        "subject": normalized_subject,
+        "grade": normalized_grade,
+        "resources": resources,
+        "message": "Textbook resources fetched from database metadata.",
+    }
+
+
+@app.post("/textbook/assist")
+def textbook_assist(req: TextbookAssistRequest):
+    normalized_subject = normalize_subject_name(req.subject) or "physics"
+    normalized_grade = normalize_grade_value(req.grade)
+    rows = collection_rows(normalized_subject, normalized_grade, req.unit)
+    canvas = find_canvas_for_page(rows, req.current_page)
+    ar_hint = find_ar_for_page(rows, req.current_page)
+
+    return {
+        **canvas,
+        **ar_hint,
+        "current_page": req.current_page,
+        "message": "Interactive hint generated.",
+    }
+
+
+@app.post("/textbook/selection-ask")
+def textbook_selection_ask(req: TextSelectionAskRequest):
+    selected_text = normalize_grounded_answer(req.selected_text)
+    question = normalize_grounded_answer(req.question)
+    subject = normalize_subject_name(req.subject) or "physics"
+    grade = normalize_grade_value(req.grade)
+    support_subjects = [
+        normalize_subject_name(item) or normalize_grounded_answer(str(item)).lower()
+        for item in (req.support_subjects or [])
+        if str(item).strip()
+    ]
+    strong_subjects = [
+        normalize_subject_name(item) or normalize_grounded_answer(str(item)).lower()
+        for item in (req.strong_subjects or [])
+        if str(item).strip()
+    ]
+    student_name = normalize_grounded_answer(req.full_name or "").strip()
+    if student_name:
+        student_name = student_name.split()[0]
+
+    if not question:
+        return {
+            "response": "Please type a question about the selected text.",
+            "selected_text": selected_text,
+            "current_page": req.current_page,
+            "subject": subject,
+            "grade": grade,
+            "message": "Question is required.",
+        }
+
+    rows = collection_rows(subject, grade, req.unit)
+    if req.current_page is not None and req.current_page > 0:
+        page_rows = [row for row in rows if metadata_page(row.get("metadata", {})) == req.current_page]
+        rows_for_rank = page_rows or rows
+    else:
+        rows_for_rank = rows
+
+    ranked = rank_rows(f"{question} {selected_text}".strip(), rows_for_rank)
+    if not ranked:
+        retrieval_result, error_message = fetch_textbook_context(f"{question} {selected_text}", grade, subject)
+        if error_message:
+            return {
+                "response": POLITE_INSUFFICIENT_INFO_MESSAGE,
+                "selected_text": selected_text,
+                "current_page": req.current_page,
+                "subject": subject,
+                "grade": grade,
+                "message": error_message,
+            }
+        context_rows = [{"document": retrieval_result.get("context_text", ""), "metadata": {}}]
+    else:
+        context_rows = ranked
+
+    performance_band = normalize_grounded_answer(req.performance_band or "")
+    mastery_score_text = str(req.mastery_score) if req.mastery_score is not None else "unknown"
+
+    level_guidance = "Teach with balanced depth and clear steps."
+    if subject in support_subjects:
+        level_guidance = (
+            "This is a support subject for the student. Keep explanation simple, step-by-step, "
+            "with short sentences and one concrete example."
+        )
+    elif subject in strong_subjects:
+        level_guidance = (
+            "This is a strong subject for the student. Give a concise answer first, then include "
+            "one extension insight or challenge."
+        )
+
+    composed_question = (
+        f"Student grade: {grade}\n"
+        f"Subject: {subject}\n\n"
+        f"Support subjects: {', '.join(support_subjects) if support_subjects else 'none'}\n"
+        f"Strong subjects: {', '.join(strong_subjects) if strong_subjects else 'none'}\n"
+        f"Performance band: {performance_band or 'unknown'}\n"
+        f"Mastery score: {mastery_score_text}\n"
+        f"Teaching guidance: {level_guidance}\n\n"
+        "Selected textbook text:\n"
+        f"{selected_text}\n\n"
+        "Student question:\n"
+        f"{question}\n\n"
+        "Do not include markdown symbols or activity sections."
+    )
+
+    concise_answer = None
+    try:
+        context_text = "\n\n".join(row.get("document", "") for row in context_rows[:TOP_K]).strip()
+        if is_selection_direct_answer_request(question):
+            selection_prompt = (
+                "You are EduTwin tutor. Use only the context below. "
+                "Return only the final direct answer text in one short sentence. "
+                "No markdown, no headings, no examples, no lesson notes.\n\n"
+                f"CONTEXT:\n{context_text}\n\n"
+                f"SELECTED TEXT:\n{selected_text or 'none'}\n\n"
+                f"QUESTION:\n{question}"
+            )
+        else:
+            selection_prompt = (
+                "You are EduTwin tutor. Use only the context below. "
+                "Explain clearly in 4 to 6 simple sentences for the student's grade level. "
+                "Keep it focused on the selected text and question. "
+                "No markdown, no headings, no example/activity sections.\n\n"
+                f"CONTEXT:\n{context_text}\n\n"
+                f"SELECTED TEXT:\n{selected_text or 'none'}\n\n"
+                f"QUESTION:\n{question}"
+            )
+        response = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": selection_prompt}],
+            options={"temperature": 0.0},
+        )
+        concise_answer = normalize_grounded_answer(response.get("message", {}).get("content", ""))
+    except Exception:
+        concise_answer = None
+
+    if not concise_answer:
+        concise_answer = POLITE_INSUFFICIENT_INFO_MESSAGE
+
+    answer = sanitize_selection_response(concise_answer)
+    if student_name and answer:
+        lowered = answer.lower()
+        if not lowered.startswith("hey ") and not lowered.startswith("hello ") and not lowered.startswith("hi "):
+            answer = f"Hey {student_name}, {answer}"
+
+    return {
+        "response": answer,
+        "selected_text": selected_text,
+        "current_page": req.current_page,
+        "subject": subject,
+        "grade": grade,
+        "support_subjects": support_subjects,
+        "strong_subjects": strong_subjects,
+        "performance_band": performance_band or None,
+        "mastery_score": req.mastery_score,
+        "message": "Answered from selected textbook text.",
+    }
 
 
 @app.post("/chat")
