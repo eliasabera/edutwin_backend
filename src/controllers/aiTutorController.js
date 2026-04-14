@@ -344,10 +344,39 @@ const getChatHistory = async (req, res) => {
 	}
 };
 
+const getLatestChatHistory = async (req, res) => {
+	try {
+		const userId = req.user?.id;
+		if (!userId || !isValidId(userId)) {
+			return res.status(401).json({ success: false, message: "Unauthorized" });
+		}
+
+		const student = await StudentProfile.findOne({ user_id: userId }).select("_id");
+		if (!student?._id) {
+			return res.status(200).json({ success: true, session_id: null, data: [] });
+		}
+
+		const latestSession = await ChatSession.findOne({ student_id: student._id }).sort({ started_at: -1, _id: -1 });
+		if (!latestSession?._id) {
+			return res.status(200).json({ success: true, session_id: null, data: [] });
+		}
+
+		const messages = await ChatMessage.find({ session_id: latestSession._id }).sort({ timestamp: 1 });
+		return res.status(200).json({
+			success: true,
+			session_id: String(latestSession._id),
+			data: messages,
+		});
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to fetch latest chat history", error: error.message });
+	}
+};
+
 module.exports = {
 	startChatSession,
 	sendMessage,
 	getChatHistory,
+	getLatestChatHistory,
 	chat,
 	chatStream,
 };

@@ -8,6 +8,7 @@ const {
 	getQuizById,
 	getMyCreatedQuizzes,
 	getMyPracticeQuizzes,
+	getPracticeLibraryQuizzes,
 	submitQuizAttempt,
 	generateAiPracticeQuiz,
 } = require("../controllers/quizController");
@@ -15,6 +16,7 @@ const {
 const router = express.Router();
 
 router.get("/mine", auth, roleCheck("TEACHER"), getMyCreatedQuizzes);
+router.get("/library", auth, roleCheck("STUDENT", "ADMIN", "TEACHER"), getPracticeLibraryQuizzes);
 router.get("/my-practice", auth, roleCheck("STUDENT", "ADMIN", "TEACHER"), getMyPracticeQuizzes);
 router.get("/class/:classId/assignments", auth, getAssignedQuizzesForClass);
 router.get("/:quizId", auth, getQuizById);

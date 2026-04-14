@@ -36,6 +36,21 @@ const resolveStudentProfileForRequest = async (req, body = {}) => {
 	return null;
 };
 
+const resolveStudentIdForAttempt = async (req, body = {}) => {
+	if (body.student_id && isValidId(body.student_id)) {
+		return body.student_id;
+	}
+
+	if (req.user?.id && isValidId(req.user.id)) {
+		const profile = await StudentProfile.findOne({ user_id: req.user.id }).select("_id");
+		if (profile?._id) {
+			return String(profile._id);
+		}
+	}
+
+	return null;
+};
+
 const resolveSubjectForRequest = async (body = {}) => {
 	if (body.subject_id && isValidId(body.subject_id)) {
 		const byId = await Subject.findById(body.subject_id);
@@ -72,6 +87,28 @@ const normalizeQuestionsPayload = (questions = []) =>
 				explanation: q.explanation,
 		  }))
 		: [];
+
+const dedupeByQuestionText = (questions = []) => {
+	const seen = new Set();
+	const deduped = [];
+
+	for (const item of questions) {
+		const key = String(item?.question_text || "").trim().toLowerCase();
+		if (!key || seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(item);
+	}
+
+	return deduped;
+};
+
+const normalizeComparableText = (value = "") =>
+	String(value)
+		.trim()
+		.toLowerCase()
+		.replace(/[^a-z0-9\s]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 
 const persistQuizWithQuestions = async (quizPayload, normalizedQuestions) => {
 	let quiz = null;
@@ -241,11 +278,14 @@ const generateAiPracticeQuiz = async (req, res) => {
 			});
 		}
 
-		const aiPayload = {
+		const requestedCount = Math.max(1, Math.min(30, Number(num_questions) > 0 ? Number(num_questions) : 5));
+		const requestedTypes = Array.isArray(types) && types.length > 0 ? types : ["mcq", "true_false", "short"];
+
+		const baseAiPayload = {
 			subject: subject || subjectDoc.name,
 			topic: topic || subjectDoc.name,
-			num_questions: Number(num_questions) > 0 ? Number(num_questions) : 5,
-			types: Array.isArray(types) && types.length > 0 ? types : ["mcq", "true_false", "short"],
+			num_questions: requestedCount,
+			types: requestedTypes,
 			grade: grade || studentProfile?.grade_level || subjectDoc.grade_level || 9,
 			student_profile:
 				student_profile ||
@@ -257,46 +297,111 @@ const generateAiPracticeQuiz = async (req, res) => {
 					: undefined),
 		};
 
-		const { data } = await axios.post(`${AI_SERVICE_BASE_URL}/practice`, aiPayload, { timeout: 60000 });
-		const aiQuestions = Array.isArray(data?.questions) ? data.questions : [];
+		const collectedAiQuestions = [];
+		let lastAiData = null;
+		let lastAiError = null;
+		const maxAttempts = 2;
+		let attemptsUsed = 0;
 
-		if (aiQuestions.length === 0) {
-			return res.status(422).json({
+		for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+			if (collectedAiQuestions.length >= requestedCount) break;
+
+			const remaining = requestedCount - collectedAiQuestions.length;
+			const aiPayload = {
+				...baseAiPayload,
+				num_questions: remaining,
+			};
+
+			const timeoutMs = attempt === 0 ? 45000 : 35000;
+
+			try {
+				const { data } = await axios.post(`${AI_SERVICE_BASE_URL}/practice`, aiPayload, { timeout: timeoutMs });
+				lastAiData = data;
+				attemptsUsed += 1;
+				const batch = Array.isArray(data?.questions) ? data.questions : [];
+				if (batch.length === 0) continue;
+				collectedAiQuestions.push(...batch);
+			} catch (aiError) {
+				lastAiError = aiError;
+				continue;
+			}
+		}
+
+		if (collectedAiQuestions.length === 0) {
+			return res.status(502).json({
 				success: false,
-				message: data?.error || "AI did not return practice questions",
-				data: { raw: data || null },
+				message: "AI service did not return practice questions",
+				error: lastAiError?.message || lastAiData?.error || "AI service unavailable",
+				data: { raw: lastAiData || null },
 			});
 		}
 
 		const normalizedQuestions = normalizeQuestionsPayload(
-			aiQuestions
-				.map((q, index) => ({
-					question_type: normalizeAiQuestionType(q.type),
-					question_text: q.question,
-					options:
-						normalizeAiQuestionType(q.type) === "TRUE_FALSE"
-							? ["TRUE", "FALSE"]
-							: Array.isArray(q.options)
-								? q.options
-								: [],
-					correct_answer: q.answer,
-					explanation: q.explanation,
-					points: 1,
-					order_index: index + 1,
-					hint: null,
-				}))
+			collectedAiQuestions
+				.map((q, index) => {
+					const rawType = normalizeAiQuestionType(q.type);
+					const questionText =
+						typeof q.question === "string" && q.question.trim()
+							? q.question.trim()
+							: (typeof q.question_text === "string" ? q.question_text.trim() : "");
+					const correctAnswer =
+						typeof q.answer === "string" && q.answer.trim()
+							? q.answer.trim()
+							: (typeof q.correct_answer === "string" ? q.correct_answer.trim() : "");
+					const explanationText =
+						typeof q.explanation === "string" && q.explanation.trim()
+							? q.explanation.trim()
+							: "Review the chapter concept and compare your answer with the expected reasoning.";
+
+					let questionType = rawType;
+					let options = Array.isArray(q.options)
+						? q.options.map((item) => String(item || "").trim()).filter(Boolean)
+						: [];
+
+					if (questionType === "TRUE_FALSE") {
+						options = ["TRUE", "FALSE"];
+					}
+
+					if (questionType === "MCQ" && options.length < 2) {
+						questionType = "SHORT_ANSWER";
+						options = [];
+					}
+
+					return {
+						question_type: questionType,
+						question_text: questionText,
+						options,
+						correct_answer: correctAnswer,
+						explanation: explanationText,
+						points: 1,
+						order_index: index + 1,
+						hint:
+							normalizeComparableText(
+								typeof q.hint === "string" && q.hint.trim() ? q.hint.trim() : ""
+							) === normalizeComparableText(explanationText)
+								? null
+								: (typeof q.hint === "string" && q.hint.trim() ? q.hint.trim() : null),
+					};
+				})
 				.filter((q) => q.question_type && q.question_text && q.correct_answer !== undefined && q.explanation)
 		);
 
-		if (normalizedQuestions.length === 0) {
+		const dedupedQuestions = dedupeByQuestionText(normalizedQuestions)
+			.slice(0, requestedCount)
+			.map((question, index) => ({
+				...question,
+				order_index: index + 1,
+			}));
+
+		if (dedupedQuestions.length === 0) {
 			return res.status(422).json({
 				success: false,
 				message: "AI response did not contain valid quiz question format",
-				data: { raw: data || null },
+				data: { raw: lastAiData || null },
 			});
 		}
 
-		const calculatedTotalPossible = normalizedQuestions.reduce((sum, q) => sum + Number(q.points || 0), 0);
+		const calculatedTotalPossible = dedupedQuestions.reduce((sum, q) => sum + Number(q.points || 0), 0);
 		const quizPayload = {
 			subject_id: subjectDoc._id,
 			creator_type: "AI",
@@ -310,7 +415,7 @@ const generateAiPracticeQuiz = async (req, res) => {
 			total_score_possible: calculatedTotalPossible,
 		};
 
-		const { quiz, createdQuestions } = await persistQuizWithQuestions(quizPayload, normalizedQuestions);
+		const { quiz, createdQuestions } = await persistQuizWithQuestions(quizPayload, dedupedQuestions);
 
 		return res.status(201).json({
 			success: true,
@@ -319,9 +424,11 @@ const generateAiPracticeQuiz = async (req, res) => {
 				quiz,
 				questions: createdQuestions,
 				ai_meta: {
-					subject: aiPayload.subject,
-					topic: aiPayload.topic,
-					num_questions: normalizedQuestions.length,
+					subject: baseAiPayload.subject,
+					topic: baseAiPayload.topic,
+					requested_questions: requestedCount,
+					num_questions: dedupedQuestions.length,
+					attempts_used: attemptsUsed,
 				},
 			},
 		});
@@ -368,7 +475,13 @@ const getQuizById = async (req, res) => {
 		if (!quiz) return res.status(404).json({ success: false, message: "Quiz not found" });
 
 		const questions = await Question.find({ quiz_id: quiz._id }).sort({ order_index: 1, _id: 1 });
-		return res.status(200).json({ success: true, data: { quiz, questions } });
+		let subject = null;
+		if (quiz.subject_id && isValidId(quiz.subject_id)) {
+			const subjectDoc = await Subject.findById(quiz.subject_id).select("name");
+			subject = subjectDoc?.name || null;
+		}
+
+		return res.status(200).json({ success: true, data: { quiz, subject, questions } });
 	} catch (error) {
 		return res.status(500).json({ success: false, message: "Failed to fetch quiz", error: error.message });
 	}
@@ -424,6 +537,7 @@ const getMyPracticeQuizzes = async (req, res) => {
 			creator_type: "AI",
 			student_id: studentProfile._id,
 		})
+			.populate("subject_id", "name")
 			.sort({ created_at: -1 })
 			.lean();
 
@@ -436,6 +550,7 @@ const getMyPracticeQuizzes = async (req, res) => {
 
 		const data = quizzes.map((item) => ({
 			...item,
+			subject_name: item?.subject_id?.name || null,
 			question_count: countMap.get(String(item._id)) || 0,
 		}));
 
@@ -445,16 +560,51 @@ const getMyPracticeQuizzes = async (req, res) => {
 	}
 };
 
+const getPracticeLibraryQuizzes = async (_req, res) => {
+	try {
+		const quizzes = await Quiz.find({
+			creator_type: "TEACHER",
+			status: "PUBLISHED",
+		})
+			.populate("subject_id", "name")
+			.sort({ created_at: -1 })
+			.limit(100)
+			.lean();
+
+		const quizIds = quizzes.map((item) => item._id);
+		const counts = await Question.aggregate([
+			{ $match: { quiz_id: { $in: quizIds } } },
+			{ $group: { _id: "$quiz_id", count: { $sum: 1 } } },
+		]);
+		const countMap = new Map(counts.map((item) => [String(item._id), item.count]));
+
+		const data = quizzes.map((item) => ({
+			...item,
+			subject_name: item?.subject_id?.name || null,
+			question_count: countMap.get(String(item._id)) || 0,
+		}));
+
+		return res.status(200).json({ success: true, data });
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to fetch practice library", error: error.message });
+	}
+};
+
 const submitQuizAttempt = async (req, res) => {
 	try {
 		const { quiz_id, student_id, answers } = req.body;
-		if (!quiz_id || !student_id || !Array.isArray(answers)) {
-			return res.status(400).json({ success: false, message: "quiz_id, student_id and answers are required" });
+		if (!quiz_id || !Array.isArray(answers)) {
+			return res.status(400).json({ success: false, message: "quiz_id and answers are required" });
+		}
+
+		const resolvedStudentId = await resolveStudentIdForAttempt(req, { student_id });
+		if (!resolvedStudentId) {
+			return res.status(400).json({ success: false, message: "student_id is required or you must be logged in as a student" });
 		}
 
 		const attempt = await QuizAttempt.create({
 			quiz_id,
-			student_id,
+			student_id: resolvedStudentId,
 			started_at: new Date(),
 			completed_at: new Date(),
 		});
@@ -523,6 +673,7 @@ module.exports = {
 	getQuizById,
 	getMyCreatedQuizzes,
 	getMyPracticeQuizzes,
+	getPracticeLibraryQuizzes,
 	submitQuizAttempt,
 	generateAiPracticeQuiz,
 };

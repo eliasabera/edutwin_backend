@@ -3,6 +3,105 @@ const { TwinProfile, Achievement, StudentAchievement } = require("../models");
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
+const toDateKey = (value) => {
+	const date = value instanceof Date ? value : new Date(value);
+	if (Number.isNaN(date.getTime())) return null;
+	const year = date.getFullYear();
+	const month = `${date.getMonth() + 1}`.padStart(2, "0");
+	const day = `${date.getDate()}`.padStart(2, "0");
+	return `${year}-${month}-${day}`;
+};
+
+const getYesterdayKey = (todayKey) => {
+	const date = new Date(`${todayKey}T00:00:00`);
+	date.setDate(date.getDate() - 1);
+	return toDateKey(date);
+};
+
+const normalizeSubject = (subject) => {
+	const value = String(subject || "").trim().toLowerCase();
+	if (["biology", "chemistry", "physics", "math"].includes(value)) {
+		return value;
+	}
+	return null;
+};
+
+const ensureTwinProfile = async (studentId, updates = {}) => {
+	let twinProfile = await TwinProfile.findOne({ student_id: studentId });
+	if (!twinProfile) {
+		twinProfile = await TwinProfile.create({
+			student_id: studentId,
+			performance_band: updates.performance_band || "medium",
+			mastery_percentage: updates.mastery_percentage || 0,
+			strong_subjects: Array.isArray(updates.strong_subjects) ? updates.strong_subjects : [],
+			support_subjects: Array.isArray(updates.support_subjects) ? updates.support_subjects : [],
+			xp: 0,
+			streak: updates.streak || 0,
+		});
+	}
+	return twinProfile;
+};
+
+const applyTwinUpdate = async (twinProfile, payload = {}) => {
+	const todayKey = toDateKey(new Date());
+	const lastActiveKey = twinProfile.last_active ? toDateKey(twinProfile.last_active) : null;
+
+	const xpDelta = Number(payload.xp_delta || 0);
+	twinProfile.xp = Math.max(0, Number(twinProfile.xp || 0) + xpDelta);
+
+	if (lastActiveKey !== todayKey) {
+		twinProfile.streak =
+			lastActiveKey === getYesterdayKey(todayKey)
+				? Number(twinProfile.streak || 0) + 1
+				: 1;
+	}
+
+	const subject = normalizeSubject(payload.subject);
+	const score = payload.score !== undefined ? Number(payload.score) : null;
+	const totalQuestions = payload.totalQuestions !== undefined ? Number(payload.totalQuestions) : null;
+	const completionPercent =
+		score !== null && totalQuestions && totalQuestions > 0
+			? Math.round((score / totalQuestions) * 100)
+			: null;
+
+	if (typeof payload.mastery_percentage === "number") {
+		twinProfile.mastery_percentage = payload.mastery_percentage;
+	}
+
+	if (payload.performance_band) {
+		twinProfile.performance_band = payload.performance_band;
+	} else if (completionPercent !== null) {
+		twinProfile.performance_band =
+			completionPercent >= 80 ? "top" : completionPercent >= 55 ? "medium" : "support";
+	}
+
+	const strongSubjects = new Set(
+		Array.isArray(twinProfile.strong_subjects) ? twinProfile.strong_subjects : [],
+	);
+	const supportSubjects = new Set(
+		Array.isArray(twinProfile.support_subjects) ? twinProfile.support_subjects : [],
+	);
+
+	if (subject) {
+		if (completionPercent !== null) {
+			if (completionPercent >= 80) {
+				strongSubjects.add(subject);
+				supportSubjects.delete(subject);
+			} else if (completionPercent <= 50) {
+				supportSubjects.add(subject);
+				strongSubjects.delete(subject);
+			}
+		}
+	}
+
+	twinProfile.strong_subjects = Array.from(strongSubjects);
+	twinProfile.support_subjects = Array.from(supportSubjects);
+	twinProfile.last_active = new Date();
+
+	await twinProfile.save();
+	return twinProfile;
+};
+
 const getStudentGamification = async (req, res) => {
 	try {
 		const { studentId } = req.params;
@@ -57,6 +156,25 @@ const updateTwinProgress = async (req, res) => {
 	}
 };
 
+const updateMyTwinProgress = async (req, res) => {
+	try {
+		if (!req.user?.id || !isValidId(req.user.id)) {
+			return res.status(401).json({ success: false, message: "Unauthorized" });
+		}
+
+		const studentProfile = await require("../models").StudentProfile.findOne({ user_id: req.user.id }).select("_id");
+		if (!studentProfile?._id) {
+			return res.status(404).json({ success: false, message: "Student profile not found" });
+		}
+
+		const twinProfile = await ensureTwinProfile(studentProfile._id, req.body);
+		const updated = await applyTwinUpdate(twinProfile, req.body);
+		return res.status(200).json({ success: true, message: "Twin profile updated", data: updated });
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to update twin profile", error: error.message });
+	}
+};
+
 const awardAchievement = async (req, res) => {
 	try {
 		const { student_id, achievement_id } = req.body;
@@ -80,5 +198,6 @@ const awardAchievement = async (req, res) => {
 module.exports = {
 	getStudentGamification,
 	updateTwinProgress,
+	updateMyTwinProgress,
 	awardAchievement,
 };
