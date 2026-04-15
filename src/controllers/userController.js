@@ -65,6 +65,7 @@ const getMe = async (req, res) => {
 				twin_name: "EduTwin",
 				support_subjects: Array.isArray(twinProfile?.support_subjects) ? twinProfile.support_subjects : [],
 				strong_subjects: Array.isArray(twinProfile?.strong_subjects) ? twinProfile.strong_subjects : [],
+				subject_scores: twinProfile?.subject_scores && typeof twinProfile.subject_scores === "object" ? twinProfile.subject_scores : {},
 				diagnostic_completed: !!studentProfile,
 				xp: twinProfile?.xp ?? 0,
 				streak: twinProfile?.streak ?? 0,

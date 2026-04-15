@@ -35,11 +35,67 @@ const ensureTwinProfile = async (studentId, updates = {}) => {
 			mastery_percentage: updates.mastery_percentage || 0,
 			strong_subjects: Array.isArray(updates.strong_subjects) ? updates.strong_subjects : [],
 			support_subjects: Array.isArray(updates.support_subjects) ? updates.support_subjects : [],
+			subject_scores: updates.subject_scores && typeof updates.subject_scores === "object" ? updates.subject_scores : {},
 			xp: 0,
 			streak: updates.streak || 0,
 		});
+	} else if (!twinProfile.subject_scores || typeof twinProfile.subject_scores !== "object") {
+		twinProfile.subject_scores = {};
 	}
 	return twinProfile;
+};
+
+const normalizeSubjectHistory = (value) => {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	return value;
+};
+
+const updateSubjectHistory = (currentHistory, subject, completionPercent) => {
+	const history = { ...normalizeSubjectHistory(currentHistory) };
+	if (!subject || completionPercent === null || completionPercent === undefined) {
+		return history;
+	}
+
+	const previous = history[subject] && typeof history[subject] === "object" ? history[subject] : {};
+	const attempts = Number(previous.attempts || 0) + 1;
+	const lastScore = Number(completionPercent);
+	const previousAverage = typeof previous.average === "number" ? previous.average : lastScore;
+	const average = Math.round((previousAverage * Math.max(0, attempts - 1) + lastScore) / attempts);
+
+	history[subject] = {
+		average,
+		attempts,
+		last_score: lastScore,
+		updated_at: new Date(),
+	};
+
+	return history;
+};
+
+const deriveSubjectsFromHistory = (subjectHistory) => {
+	const entries = Object.entries(normalizeSubjectHistory(subjectHistory))
+		.map(([subject, details]) => ({
+			subject,
+			average: typeof details?.average === "number" ? details.average : null,
+			attempts: Number(details?.attempts || 0),
+		}))
+		.filter((item) => item.average !== null);
+
+	const strong = [];
+	const support = [];
+
+	for (const item of entries) {
+		if (item.average >= 80 && item.attempts >= 1) {
+			strong.push(item.subject);
+		} else if (item.average <= 55 && item.attempts >= 1) {
+			support.push(item.subject);
+		}
+	}
+
+	return {
+		strong_subjects: strong,
+		support_subjects: support,
+	};
 };
 
 const applyTwinUpdate = async (twinProfile, payload = {}) => {
@@ -84,6 +140,7 @@ const applyTwinUpdate = async (twinProfile, payload = {}) => {
 
 	if (subject) {
 		if (completionPercent !== null) {
+			twinProfile.subject_scores = updateSubjectHistory(twinProfile.subject_scores, subject, completionPercent);
 			if (completionPercent >= 80) {
 				strongSubjects.add(subject);
 				supportSubjects.delete(subject);
@@ -92,6 +149,16 @@ const applyTwinUpdate = async (twinProfile, payload = {}) => {
 				strongSubjects.delete(subject);
 			}
 		}
+	}
+
+	const derived = deriveSubjectsFromHistory(twinProfile.subject_scores);
+	for (const item of derived.strong_subjects) {
+		strongSubjects.add(item);
+		supportSubjects.delete(item);
+	}
+	for (const item of derived.support_subjects) {
+		supportSubjects.add(item);
+		strongSubjects.delete(item);
 	}
 
 	twinProfile.strong_subjects = Array.from(strongSubjects);
@@ -136,6 +203,7 @@ const updateTwinProgress = async (req, res) => {
 				mastery_percentage: mastery_percentage || 0,
 				strong_subjects: strong_subjects || [],
 				support_subjects: support_subjects || [],
+				subject_scores: {},
 				xp: 0,
 				streak: streak || 0,
 			});
@@ -147,6 +215,7 @@ const updateTwinProgress = async (req, res) => {
 		if (performance_band) twinProfile.performance_band = performance_band;
 		if (Array.isArray(support_subjects)) twinProfile.support_subjects = support_subjects;
 		if (Array.isArray(strong_subjects)) twinProfile.strong_subjects = strong_subjects;
+		if (req.body && typeof req.body.subject_scores === "object") twinProfile.subject_scores = req.body.subject_scores;
 		twinProfile.last_active = new Date();
 
 		await twinProfile.save();

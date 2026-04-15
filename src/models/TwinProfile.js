@@ -8,6 +8,7 @@ const twinProfileSchema = new Schema(
     mastery_percentage: { type: Number, required: true },
     strong_subjects: { type: Schema.Types.Mixed, required: true, default: [] },
     support_subjects: { type: Schema.Types.Mixed, required: true, default: [] },
+    subject_scores: { type: Schema.Types.Mixed, required: true, default: {} },
     xp: { type: Number, required: true, default: 0 },
     streak: { type: Number, required: true, default: 0 },
     last_active: { type: Date, required: true, default: Date.now },
