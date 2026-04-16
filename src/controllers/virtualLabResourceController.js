@@ -125,7 +125,7 @@ const updateVirtualLabResource = async (req, res) => {
     };
 
     const resource = await VirtualLabResource.findByIdAndUpdate(resourceId, payload, {
-      new: true,
+      returnDocument: "after",
       runValidators: true,
     });
 

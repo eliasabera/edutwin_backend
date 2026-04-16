@@ -54,7 +54,7 @@ const updateClass = async (req, res) => {
 				...(subject_id ? { subject_id } : {}),
 				...(name ? { name: String(name).trim() } : {}),
 			},
-			{ new: true, runValidators: true }
+			{ returnDocument: "after", runValidators: true }
 		);
 
 		if (!classItem) return res.status(404).json({ success: false, message: "Class not found" });

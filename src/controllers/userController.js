@@ -97,7 +97,7 @@ const updateUser = async (req, res) => {
 		if (email) update.email = String(email).trim().toLowerCase();
 		if (role) update.role = String(role).trim().toUpperCase();
 
-		const user = await User.findByIdAndUpdate(userId, update, { new: true, runValidators: true }).select(
+		const user = await User.findByIdAndUpdate(userId, update, { returnDocument: "after", runValidators: true }).select(
 			"_id email role created_at"
 		);
 		if (!user) return res.status(404).json({ success: false, message: "User not found" });

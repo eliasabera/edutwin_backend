@@ -47,7 +47,7 @@ const updateSchool = async (req, res) => {
 		const school = await School.findByIdAndUpdate(
 			schoolId,
 			{ ...(name ? { name: String(name).trim() } : {}) },
-			{ new: true, runValidators: true }
+			{ returnDocument: "after", runValidators: true }
 		);
 		if (!school) return res.status(404).json({ success: false, message: "School not found" });
 

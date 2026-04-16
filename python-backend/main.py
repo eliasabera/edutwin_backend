@@ -252,6 +252,7 @@ class TextSelectionAskRequest(BaseModel):
     unit: Optional[str] = None
     question: str
     selected_text: str
+    history: list[dict[str, str]] = Field(default_factory=list)
     full_name: Optional[str] = None
     current_page: Optional[int] = None
     current_topic: Optional[str] = None
@@ -1115,10 +1116,9 @@ def fetch_textbook_context(query: str, grade: str, subject: str):
     master_collection_name = getattr(collections[0], "name", collections[0])
 
     try:
-        collection = db_client.get_collection(
-            master_collection_name,
-            embedding_function=get_embedding_func(),
-        )
+        # Reuse the embedding function persisted with the collection to avoid
+        # conflicts when legacy/default collections already exist.
+        collection = db_client.get_collection(master_collection_name)
 
         retrieval_queries = build_retrieval_queries(query, subject)
         subject_candidates = []
@@ -1593,6 +1593,21 @@ def is_selection_direct_answer_request(question: str):
     return any(marker in lowered for marker in direct_markers)
 
 
+def is_generic_selection_prompt(question: str):
+    lowered = normalize_match_text(question)
+    generic_prompts = {
+        "answer",
+        "answer question",
+        "answer the question",
+        "solve",
+        "solve this",
+        "give answer",
+        "give the answer",
+        "only answer",
+    }
+    return lowered in generic_prompts
+
+
 def add_student_intro(answer: str, profile: StudentProfile, question: str):
     cleaned_answer = normalize_grounded_answer(answer)
     if not cleaned_answer:
@@ -1926,6 +1941,8 @@ def textbook_assist(req: TextbookAssistRequest):
 @app.post("/textbook/selection-ask")
 def textbook_selection_ask(req: TextSelectionAskRequest):
     selected_text = normalize_grounded_answer(req.selected_text)
+    # Large highlighted passages can overflow model context and look like retrieval failure.
+    selected_text_excerpt = selected_text[:1800] if selected_text else ""
     question = normalize_grounded_answer(req.question)
     subject = normalize_subject_name(req.subject) or "physics"
     grade = normalize_grade_value(req.grade)
@@ -1954,15 +1971,21 @@ def textbook_selection_ask(req: TextSelectionAskRequest):
         }
 
     rows = collection_rows(subject, grade, req.unit)
+    query_text = f"{question} {selected_text_excerpt}".strip() or question
     if req.current_page is not None and req.current_page > 0:
         page_rows = [row for row in rows if metadata_page(row.get("metadata", {})) == req.current_page]
         rows_for_rank = page_rows or rows
     else:
         rows_for_rank = rows
 
-    ranked = rank_rows(f"{question} {selected_text}".strip(), rows_for_rank)
+    ranked = rank_rows(query_text, rows_for_rank)
+    ranked_context_text = "\n\n".join(row.get("document", "") for row in ranked[:TOP_K]).strip()
+    retrieval_result = None
+    teacher_guide_context = ""
+    textbook_context = ranked_context_text
+
     if not ranked:
-        retrieval_result, error_message = fetch_textbook_context(f"{question} {selected_text}", grade, subject)
+        retrieval_result, error_message = fetch_textbook_context(query_text, grade, subject)
         if error_message:
             return {
                 "response": POLITE_INSUFFICIENT_INFO_MESSAGE,
@@ -1972,79 +1995,97 @@ def textbook_selection_ask(req: TextSelectionAskRequest):
                 "grade": grade,
                 "message": error_message,
             }
-        context_rows = [{"document": retrieval_result.get("context_text", ""), "metadata": {}}]
-    else:
-        context_rows = ranked
+        textbook_context = str(retrieval_result.get("textbook_context_text", "") or "").strip()
+        teacher_guide_context = str(retrieval_result.get("teacher_guide_context_text", "") or "").strip()
 
     performance_band = normalize_grounded_answer(req.performance_band or "")
-    mastery_score_text = str(req.mastery_score) if req.mastery_score is not None else "unknown"
 
-    level_guidance = "Teach with balanced depth and clear steps."
-    if subject in support_subjects:
-        level_guidance = (
-            "This is a support subject for the student. Keep explanation simple, step-by-step, "
-            "with short sentences and one concrete example."
-        )
-    elif subject in strong_subjects:
-        level_guidance = (
-            "This is a strong subject for the student. Give a concise answer first, then include "
-            "one extension insight or challenge."
+    profile = StudentProfile(
+        full_name=req.full_name or "Student",
+        grade=grade,
+        performance_band=(req.performance_band or "medium") if (req.performance_band or "").strip() in {"support", "low", "medium", "top"} else "medium",
+        mastery_score=int(req.mastery_score) if req.mastery_score is not None else 50,
+        support_subjects=[item for item in support_subjects if item],
+        strong_subjects=[item for item in strong_subjects if item],
+    )
+
+    if selected_text_excerpt:
+        textbook_context = f"Selected text excerpt:\n{selected_text_excerpt}\n\n{textbook_context}".strip()
+
+    # Keep context within practical model limits for stable responses.
+    if textbook_context:
+        textbook_context = textbook_context[:7000]
+    if teacher_guide_context:
+        teacher_guide_context = teacher_guide_context[:3000]
+
+    if not textbook_context:
+        return {
+            "response": POLITE_INSUFFICIENT_INFO_MESSAGE,
+            "selected_text": selected_text,
+            "current_page": req.current_page,
+            "subject": subject,
+            "grade": grade,
+            "message": "No grounded textbook context found for this selection.",
+        }
+
+    direct_answer_request = (
+        is_selection_direct_answer_request(question)
+        or is_generic_selection_prompt(question)
+    )
+
+    effective_question = question
+    if selected_text_excerpt and is_generic_selection_prompt(question):
+        effective_question = (
+            "Use the selected text to answer the exact textbook question and show the final answer clearly.\n\n"
+            f"Selected question text: {selected_text_excerpt}"
         )
 
     composed_question = (
-        f"Student grade: {grade}\n"
-        f"Subject: {subject}\n\n"
-        f"Support subjects: {', '.join(support_subjects) if support_subjects else 'none'}\n"
-        f"Strong subjects: {', '.join(strong_subjects) if strong_subjects else 'none'}\n"
-        f"Performance band: {performance_band or 'unknown'}\n"
-        f"Mastery score: {mastery_score_text}\n"
-        f"Teaching guidance: {level_guidance}\n\n"
-        "Selected textbook text:\n"
-        f"{selected_text}\n\n"
-        "Student question:\n"
-        f"{question}\n\n"
-        "Do not include markdown symbols or activity sections."
+        f"Student question: {effective_question}\n\n"
+        "Answer exactly what the student wants. "
+        "Do not say: I will answer, let me answer, or similar meta text. "
+        "Start directly with the answer. "
+        "If it is a calculation question, show key steps and final answer clearly. "
+        "If asked to explain more, continue the same idea with deeper but focused explanation."
     )
 
-    concise_answer = None
+    tutor_answer = None
     try:
-        context_text = "\n\n".join(row.get("document", "") for row in context_rows[:TOP_K]).strip()
-        if is_selection_direct_answer_request(question):
-            selection_prompt = (
-                "You are EduTwin tutor. Use only the context below. "
-                "Return only the final direct answer text in one short sentence. "
-                "No markdown, no headings, no examples, no lesson notes.\n\n"
-                f"CONTEXT:\n{context_text}\n\n"
-                f"SELECTED TEXT:\n{selected_text or 'none'}\n\n"
-                f"QUESTION:\n{question}"
-            )
-        else:
-            selection_prompt = (
-                "You are EduTwin tutor. Use only the context below. "
-                "Explain clearly in 4 to 6 simple sentences for the student's grade level. "
-                "Keep it focused on the selected text and question. "
-                "No markdown, no headings, no example/activity sections.\n\n"
-                f"CONTEXT:\n{context_text}\n\n"
-                f"SELECTED TEXT:\n{selected_text or 'none'}\n\n"
-                f"QUESTION:\n{question}"
-            )
+        messages = build_tutor_messages(
+            question=composed_question,
+            context_text=textbook_context,
+            profile=profile,
+            subject=subject,
+            source_grade=grade,
+            history=normalize_history(req.history or []),
+            teacher_guide_context=teacher_guide_context,
+        )
         response = ollama.chat(
             model=MODEL,
-            messages=[{"role": "user", "content": selection_prompt}],
+            messages=messages,
             options={"temperature": 0.0},
         )
-        concise_answer = normalize_grounded_answer(response.get("message", {}).get("content", ""))
-    except Exception:
-        concise_answer = None
+        ai_raw_text = response.get("message", {}).get("content", "")
+        clean_answer = sanitize_tutor_response(ai_raw_text, composed_question)
+        clean_answer = re.sub(
+            r"^(?:i\s+will\s+answer(?:\s+your)?|i\s+can\s+answer(?:\s+your)?|let\s+me\s+answer(?:\s+that)?)[^a-z0-9]+",
+            "",
+            clean_answer.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
 
-    if not concise_answer:
-        concise_answer = POLITE_INSUFFICIENT_INFO_MESSAGE
+        if direct_answer_request:
+            tutor_answer = clean_answer
+        else:
+            tutor_answer = finalize_student_answer(clean_answer, profile, question)
+    except Exception as generation_error:
+        print(f"[selection-ask] generation failed: {generation_error}")
+        tutor_answer = None
 
-    answer = sanitize_selection_response(concise_answer)
-    if student_name and answer:
-        lowered = answer.lower()
-        if not lowered.startswith("hey ") and not lowered.startswith("hello ") and not lowered.startswith("hi "):
-            answer = f"Hey {student_name}, {answer}"
+    if not tutor_answer:
+        tutor_answer = POLITE_INSUFFICIENT_INFO_MESSAGE
+
+    answer = tutor_answer.strip()
 
     return {
         "response": answer,

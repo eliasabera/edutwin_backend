@@ -1,8 +1,15 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
 const { User, StudentProfile, TeacherProfile } = require("../models");
 
 const ALLOWED_ROLES = ["STUDENT", "TEACHER", "ADMIN"];
+
+const normalizeSchoolId = (schoolId) => {
+	if (!schoolId) return null;
+	const candidate = String(schoolId).trim();
+	return mongoose.Types.ObjectId.isValid(candidate) ? candidate : null;
+};
 
 const signToken = (user) => {
 	const secret = process.env.JWT_SECRET || "dev_jwt_secret_change_me";
@@ -84,13 +91,14 @@ const register = async (req, res) => {
 
 		try {
 			if (normalizedRole === "STUDENT") {
+				const resolvedSchoolId = normalizeSchoolId(school_id);
 				profile = await StudentProfile.create({
 					user_id: user._id,
 					full_name: String(full_name).trim(),
 					phone_number: phone_number || null,
 					language: String(language).trim(),
 					grade_level: Number(grade_level),
-					school_id: school_id || null,
+					school_id: resolvedSchoolId,
 					section: section || null,
 				});
 			}
