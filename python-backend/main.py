@@ -1121,21 +1121,33 @@ def fetch_textbook_context(query: str, grade: str, subject: str):
         collection = db_client.get_collection(master_collection_name)
 
         retrieval_queries = build_retrieval_queries(query, subject)
+        normalized_grade = str(grade).strip()
         subject_candidates = []
         for candidate in [subject.capitalize(), subject.title(), subject.lower(), subject.upper(), subject]:
             if candidate not in subject_candidates:
                 subject_candidates.append(candidate)
 
-        where_filters = [
-            {
-                "$and": [
-                    {"subject": {"$eq": candidate}},
-                    {"grade": {"$eq": str(grade)}},
-                ]
-            }
-            for candidate in subject_candidates
-        ]
-        where_filters.append({"grade": {"$eq": str(grade)}})
+        # Chroma metadata can store grade as either string or int depending on ingestion path.
+        grade_candidates: list[object] = [normalized_grade]
+        if normalized_grade.isdigit():
+            numeric_grade = int(normalized_grade)
+            if numeric_grade not in grade_candidates:
+                grade_candidates.append(numeric_grade)
+
+        where_filters = []
+        for candidate in subject_candidates:
+            for grade_candidate in grade_candidates:
+                where_filters.append(
+                    {
+                        "$and": [
+                            {"subject": {"$eq": candidate}},
+                            {"grade": {"$eq": grade_candidate}},
+                        ]
+                    }
+                )
+
+        for grade_candidate in grade_candidates:
+            where_filters.append({"grade": {"$eq": grade_candidate}})
 
         ranked_rows = []
         for where_filter in where_filters:
@@ -1157,9 +1169,15 @@ def fetch_textbook_context(query: str, grade: str, subject: str):
             )
 
             strict_meta_match = [
-                row for row in broad_rows if row_matches_subject_grade(row, subject, str(grade))
+                row for row in broad_rows if row_matches_subject_grade(row, subject, normalized_grade)
             ]
             ranked_rows = strict_meta_match
+
+        # Final fallback: lexical rank within subject+grade rows.
+        # This catches exact textbook terms even when vector top-k misses them.
+        if not ranked_rows:
+            filtered_rows = collection_rows(subject, normalized_grade)
+            ranked_rows = rank_rows(query, filtered_rows)
 
         if not ranked_rows:
             return None, INSUFFICIENT_CURRICULUM_INFO_MESSAGE
@@ -1191,7 +1209,7 @@ def fetch_textbook_context(query: str, grade: str, subject: str):
             "context_text": "\n\n".join(combined_sections),
             "textbook_context_text": primary_context,
             "teacher_guide_context_text": guide_context,
-            "source_grade": str(grade),
+            "source_grade": normalized_grade,
         }, None
 
     except Exception as db_error:

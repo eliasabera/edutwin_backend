@@ -4,6 +4,9 @@ const { Schema } = mongoose;
 const virtualLabResourceSchema = new Schema(
   {
     subject_id: { type: Schema.Types.ObjectId, ref: "Subject", required: true },
+    grade_level: { type: Number, required: true },
+    chapter: { type: String, required: true, trim: true },
+    topic: { type: String, required: true, trim: true },
     title: { type: String, required: true, trim: true },
     description: { type: String, required: true },
     thumbnail_url: { type: String, required: true },
