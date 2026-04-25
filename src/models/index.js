@@ -2,6 +2,7 @@ module.exports = {
   User: require("./User"),
   StudentProfile: require("./StudentProfile"),
   TeacherProfile: require("./TeacherProfile"),
+  AdminProfile: require("./AdminProfile"),
   TwinProfile: require("./TwinProfile"),
   School: require("./School"),
   Subject: require("./Subject"),

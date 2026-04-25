@@ -41,9 +41,13 @@ const syncCatalogToDatabase = async () => {
 		}
 
 		const dbSubjectName = subjectNameForDatabase(canonicalSubject);
+		const subjectUpdate = { name: dbSubjectName, grade_level: grade };
+		if (typeof entry.cover_image_url === "string" && entry.cover_image_url.trim()) {
+			subjectUpdate.cover_image_url = entry.cover_image_url.trim();
+		}
 		const subject = await Subject.findOneAndUpdate(
 			{ name: dbSubjectName, grade_level: grade },
-			{ name: dbSubjectName, grade_level: grade },
+			subjectUpdate,
 			{ upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
 		);
 
@@ -58,6 +62,7 @@ const syncCatalogToDatabase = async () => {
 			grade,
 			title: textbook.title,
 			pdf_url: textbook.pdf_url,
+			cover_image_url: subject.cover_image_url || null,
 		});
 	}
 
@@ -237,6 +242,7 @@ const resolveTextbook = async (req, res) => {
 						grade_served: requestedGrade,
 						title: exactTextbook.title,
 						textbook_url: exactTextbook.pdf_url,
+						cover_image_url: exactSubject.cover_image_url || null,
 						source: "database",
 					},
 				});
@@ -266,6 +272,10 @@ const resolveTextbook = async (req, res) => {
 				grade_served: servedGrade,
 				title: resolved.title,
 				textbook_url: resolved.pdf_url,
+				cover_image_url:
+					typeof resolved.cover_image_url === "string" && resolved.cover_image_url.trim()
+						? resolved.cover_image_url.trim()
+						: null,
 				source: "catalog",
 			},
 		});

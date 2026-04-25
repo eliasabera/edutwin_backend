@@ -1,7 +1,7 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
-const { User, StudentProfile, TeacherProfile } = require("../models");
+const { User, StudentProfile, TeacherProfile, AdminProfile } = require("../models");
 
 const ALLOWED_ROLES = ["STUDENT", "TEACHER", "ADMIN"];
 
@@ -64,10 +64,10 @@ const register = async (req, res) => {
 			}
 		}
 
-		if (normalizedRole === "TEACHER" && !full_name) {
+		if ((normalizedRole === "TEACHER" || normalizedRole === "ADMIN") && !full_name) {
 			return res.status(400).json({
 				success: false,
-				message: "full_name is required for teacher registration",
+				message: "full_name is required for teacher/admin registration",
 			});
 		}
 
@@ -110,7 +110,20 @@ const register = async (req, res) => {
 					school_id: school_id || null,
 				});
 			}
+
+			if (normalizedRole === "ADMIN") {
+				const resolvedSchoolId = normalizeSchoolId(school_id);
+				profile = await AdminProfile.create({
+					user_id: user._id,
+					full_name: String(full_name).trim(),
+					phone_number: phone_number || null,
+					school_id: resolvedSchoolId,
+				});
+			}
 		} catch (profileError) {
+			await AdminProfile.deleteOne({ user_id: user._id });
+			await TeacherProfile.deleteOne({ user_id: user._id });
+			await StudentProfile.deleteOne({ user_id: user._id });
 			await User.findByIdAndDelete(user._id);
 			throw profileError;
 		}
@@ -125,6 +138,8 @@ const register = async (req, res) => {
 					id: user._id,
 					email: user.email,
 					role: user.role,
+					has_accepted_terms_policy: !!user.has_accepted_terms_policy,
+					terms_policy_accepted_at: user.terms_policy_accepted_at || null,
 				},
 				profile: profile ? profile.toObject() : null,
 				token,
@@ -178,6 +193,8 @@ const login = async (req, res) => {
 					id: user._id,
 					email: user.email,
 					role: user.role,
+					has_accepted_terms_policy: !!user.has_accepted_terms_policy,
+					terms_policy_accepted_at: user.terms_policy_accepted_at || null,
 				},
 				token,
 			},

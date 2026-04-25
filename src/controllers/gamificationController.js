@@ -1,5 +1,5 @@
 const mongoose = require("mongoose");
-const { TwinProfile, Achievement, StudentAchievement } = require("../models");
+const { TwinProfile, Achievement, StudentAchievement, StudentProfile } = require("../models");
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
@@ -24,6 +24,13 @@ const normalizeSubject = (subject) => {
 		return value;
 	}
 	return null;
+};
+
+const normalizeSubjectList = (items) => {
+	if (!Array.isArray(items)) return [];
+	return items
+		.map((item) => normalizeSubject(item))
+		.filter(Boolean);
 };
 
 const ensureTwinProfile = async (studentId, updates = {}) => {
@@ -122,13 +129,18 @@ const applyTwinUpdate = async (twinProfile, payload = {}) => {
 
 	if (typeof payload.mastery_percentage === "number") {
 		twinProfile.mastery_percentage = payload.mastery_percentage;
+	} else if (completionPercent !== null) {
+		twinProfile.mastery_percentage = Math.max(
+			Number(twinProfile.mastery_percentage || 0),
+			completionPercent,
+		);
 	}
 
 	if (payload.performance_band) {
 		twinProfile.performance_band = payload.performance_band;
 	} else if (completionPercent !== null) {
 		twinProfile.performance_band =
-			completionPercent >= 80 ? "top" : completionPercent >= 55 ? "medium" : "support";
+			completionPercent >= 80 ? "top" : completionPercent <= 55 ? "support" : "medium";
 	}
 
 	const strongSubjects = new Set(
@@ -138,13 +150,24 @@ const applyTwinUpdate = async (twinProfile, payload = {}) => {
 		Array.isArray(twinProfile.support_subjects) ? twinProfile.support_subjects : [],
 	);
 
+	const payloadStrong = normalizeSubjectList(payload.strong_subjects);
+	const payloadSupport = normalizeSubjectList(payload.support_subjects);
+	for (const item of payloadStrong) {
+		strongSubjects.add(item);
+		supportSubjects.delete(item);
+	}
+	for (const item of payloadSupport) {
+		supportSubjects.add(item);
+		strongSubjects.delete(item);
+	}
+
 	if (subject) {
 		if (completionPercent !== null) {
 			twinProfile.subject_scores = updateSubjectHistory(twinProfile.subject_scores, subject, completionPercent);
 			if (completionPercent >= 80) {
 				strongSubjects.add(subject);
 				supportSubjects.delete(subject);
-			} else if (completionPercent <= 50) {
+			} else if (completionPercent <= 55) {
 				supportSubjects.add(subject);
 				strongSubjects.delete(subject);
 			}
@@ -244,6 +267,53 @@ const updateMyTwinProgress = async (req, res) => {
 	}
 };
 
+const redeemLabBonusUnlock = async (req, res) => {
+	try {
+		if (!req.user?.id || !isValidId(req.user.id)) {
+			return res.status(401).json({ success: false, message: "Unauthorized" });
+		}
+
+		const studentProfile = await StudentProfile.findOne({ user_id: req.user.id }).select("_id");
+		if (!studentProfile?._id) {
+			return res.status(404).json({ success: false, message: "Student profile not found" });
+		}
+
+		let twinProfile = await TwinProfile.findOne({ student_id: studentProfile._id });
+		if (!twinProfile) {
+			twinProfile = await ensureTwinProfile(studentProfile._id, {});
+		}
+
+		if (twinProfile.lab_bonus_unlock) {
+			return res.status(200).json({
+				success: true,
+				message: "Lab bonus already unlocked",
+				data: twinProfile,
+			});
+		}
+
+		const currentXp = Number(twinProfile.xp || 0);
+		if (currentXp < 2000) {
+			return res.status(400).json({
+				success: false,
+				message: "At least 2000 XP is required to unlock the lab bonus",
+			});
+		}
+
+		twinProfile.lab_bonus_unlock = true;
+		twinProfile.xp = 0;
+		twinProfile.last_active = new Date();
+		await twinProfile.save();
+
+		return res.status(200).json({
+			success: true,
+			message: "Lab bonus unlocked",
+			data: twinProfile,
+		});
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to redeem lab bonus", error: error.message });
+	}
+};
+
 const awardAchievement = async (req, res) => {
 	try {
 		const { student_id, achievement_id } = req.body;
@@ -268,5 +338,6 @@ module.exports = {
 	getStudentGamification,
 	updateTwinProgress,
 	updateMyTwinProgress,
+	redeemLabBonusUnlock,
 	awardAchievement,
 };

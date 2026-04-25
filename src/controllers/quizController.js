@@ -1,6 +1,6 @@
 const mongoose = require("mongoose");
 const axios = require("axios");
-const { Quiz, QuizAssignment, Question, QuizAttempt, StudentAnswer, TeacherProfile, Subject, StudentProfile } = require("../models");
+const { Quiz, QuizAssignment, Question, QuizAttempt, StudentAnswer, TeacherProfile, Subject, StudentProfile, User } = require("../models");
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 const isTransactionUnsupportedError = (error) => {
@@ -174,6 +174,8 @@ const createQuiz = async (req, res) => {
 	try {
 		const {
 			subject_id,
+			subject,
+			grade,
 			creator_type,
 			teacher_id,
 			student_id,
@@ -186,7 +188,9 @@ const createQuiz = async (req, res) => {
 			total_score_possible,
 		} = req.body;
 		if (!subject_id || !creator_type) {
-			return res.status(400).json({ success: false, message: "subject_id and creator_type are required" });
+			if (!subject && !subject_id) {
+				return res.status(400).json({ success: false, message: "subject or subject_id and creator_type are required" });
+			}
 		}
 
 		const normalizedCreatorType = String(creator_type).toUpperCase();
@@ -194,8 +198,23 @@ const createQuiz = async (req, res) => {
 			return res.status(400).json({ success: false, message: "creator_type must be AI or TEACHER" });
 		}
 
-		if (normalizedCreatorType === "TEACHER" && !teacher_id) {
-			return res.status(400).json({ success: false, message: "teacher_id is required for TEACHER-created quizzes" });
+		let resolvedTeacherId = null;
+		if (normalizedCreatorType === "TEACHER") {
+			if (req.user?.role === "TEACHER") {
+				const teacherProfile = await TeacherProfile.findOne({ user_id: req.user.id }).select("_id");
+				if (!teacherProfile?._id) {
+					return res.status(404).json({ success: false, message: "teacher profile not found" });
+				}
+				resolvedTeacherId = teacherProfile._id;
+			} else if (teacher_id && isValidId(teacher_id)) {
+				const teacherProfile = await TeacherProfile.findById(teacher_id).select("_id");
+				if (!teacherProfile?._id) {
+					return res.status(400).json({ success: false, message: "invalid teacher_id" });
+				}
+				resolvedTeacherId = teacherProfile._id;
+			} else {
+				return res.status(400).json({ success: false, message: "teacher context is required for TEACHER-created quizzes" });
+			}
 		}
 
 		if (normalizedCreatorType === "AI" && teacher_id) {
@@ -205,7 +224,7 @@ const createQuiz = async (req, res) => {
 		if (Array.isArray(questions) && questions.length > 0) {
 			for (let i = 0; i < questions.length; i += 1) {
 				const q = questions[i];
-				if (!q.question_type || !q.question_text || q.correct_answer === undefined || !q.explanation) {
+				if (!q.question_type || !q.question_text || q.correct_answer === undefined) {
 					return res.status(400).json({
 						success: false,
 						message: `Invalid question payload at index ${i}`,
@@ -221,13 +240,24 @@ const createQuiz = async (req, res) => {
 			}
 		}
 
-		const normalizedQuestions = normalizeQuestionsPayload(questions);
+		const normalizedQuestions = normalizeQuestionsPayload(questions).map((question) => ({
+			...question,
+			explanation: question.explanation || `Review the concept and compare your answer with the correct answer for ${question.question_text}`,
+		}));
+
+		const subjectDoc = await resolveSubjectForRequest({ subject, subject_id, grade });
+		if (!subjectDoc) {
+			return res.status(400).json({
+				success: false,
+				message: "subject or valid subject_id is required",
+			});
+		}
 
 		const calculatedTotalPossible = normalizedQuestions.reduce((sum, q) => sum + Number(q.points || 0), 0);
 		const quizPayload = {
-			subject_id,
+			subject_id: subjectDoc._id,
 			creator_type: normalizedCreatorType,
-			teacher_id: normalizedCreatorType === "TEACHER" ? teacher_id : null,
+			teacher_id: normalizedCreatorType === "TEACHER" ? resolvedTeacherId : null,
 			student_id: student_id || null,
 			topic: topic || null,
 			title: title || null,
@@ -514,11 +544,98 @@ const getMyCreatedQuizzes = async (req, res) => {
 		const quizzes = await Quiz.find({
 			creator_type: "TEACHER",
 			teacher_id: { $in: teacherIds },
-		}).sort({ created_at: -1 });
+		})
+			.populate("subject_id", "name grade_level")
+			.sort({ created_at: -1 })
+			.lean();
 
-		return res.status(200).json({ success: true, data: quizzes });
+		const quizIds = quizzes.map((quiz) => quiz._id);
+		const counts = quizIds.length > 0
+			? await Question.aggregate([
+				{ $match: { quiz_id: { $in: quizIds } } },
+				{ $group: { _id: "$quiz_id", count: { $sum: 1 } } },
+			])
+			: [];
+		const countMap = new Map(counts.map((item) => [String(item._id), item.count]));
+
+		const data = quizzes.map((quiz) => ({
+			...quiz,
+			subject_name: quiz?.subject_id?.name || null,
+			grade: quiz?.subject_id?.grade_level ?? null,
+			question_count: countMap.get(String(quiz._id)) || 0,
+		}));
+
+		return res.status(200).json({ success: true, data });
 	} catch (error) {
 		return res.status(500).json({ success: false, message: "Failed to fetch created quizzes", error: error.message });
+	}
+};
+
+const getAdminGeneratedQuizzes = async (req, res) => {
+	try {
+		const quizzes = await Quiz.find({ creator_type: "TEACHER" })
+			.populate("subject_id", "name grade_level")
+			.populate({ path: "teacher_id", select: "full_name user_id" })
+			.sort({ created_at: -1 })
+			.lean();
+
+		const quizIds = quizzes.map((quiz) => quiz._id);
+		const counts = quizIds.length > 0
+			? await Question.aggregate([
+				{ $match: { quiz_id: { $in: quizIds } } },
+				{ $group: { _id: "$quiz_id", count: { $sum: 1 } } },
+			])
+			: [];
+		const countMap = new Map(counts.map((item) => [String(item._id), item.count]));
+
+		const teacherUserIds = quizzes
+			.map((quiz) => quiz.teacher_id?.user_id)
+			.filter(Boolean);
+		const teacherUsers = teacherUserIds.length > 0
+			? await User.find({ _id: { $in: teacherUserIds } }).select("_id email role")
+			: [];
+		const teacherUserMap = new Map(teacherUsers.map((user) => [String(user._id), user]));
+
+		const data = quizzes.map((quiz) => {
+			const teacherUser = teacherUserMap.get(String(quiz.teacher_id?.user_id || ""));
+			return {
+				...quiz,
+				subject_name: quiz?.subject_id?.name || null,
+				grade: quiz?.subject_id?.grade_level ?? null,
+				question_count: countMap.get(String(quiz._id)) || 0,
+				teacher_name: quiz?.teacher_id?.full_name || "-",
+				teacher_email: teacherUser?.email || "-",
+			};
+		});
+
+		return res.status(200).json({ success: true, data });
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to fetch admin generated quizzes", error: error.message });
+	}
+};
+
+const approveQuiz = async (req, res) => {
+	try {
+		const { quizId } = req.params;
+		if (!isValidId(quizId)) {
+			return res.status(400).json({ success: false, message: "Invalid quiz id" });
+		}
+
+		const quiz = await Quiz.findById(quizId);
+		if (!quiz) {
+			return res.status(404).json({ success: false, message: "Quiz not found" });
+		}
+
+		quiz.status = "PUBLISHED";
+		await quiz.save();
+
+		return res.status(200).json({
+			success: true,
+			message: "Quiz approved",
+			data: quiz,
+		});
+	} catch (error) {
+		return res.status(500).json({ success: false, message: "Failed to approve quiz", error: error.message });
 	}
 };
 
@@ -672,8 +789,10 @@ module.exports = {
 	getAssignedQuizzesForClass,
 	getQuizById,
 	getMyCreatedQuizzes,
+	getAdminGeneratedQuizzes,
 	getMyPracticeQuizzes,
 	getPracticeLibraryQuizzes,
 	submitQuizAttempt,
 	generateAiPracticeQuiz,
+	approveQuiz,
 };

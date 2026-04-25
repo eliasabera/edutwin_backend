@@ -3,6 +3,8 @@ const cors = require("cors");
 const helmet = require("helmet");
 const authRoutes = require("./routes/auth");
 const userRoutes = require("./routes/users");
+const teacherRoutes = require("./routes/teachers");
+const adminRoutes = require("./routes/admins");
 const schoolRoutes = require("./routes/schools");
 const classRoutes = require("./routes/classes");
 const textbookRoutes = require("./routes/textbooks");
@@ -12,6 +14,7 @@ const gamificationRoutes = require("./routes/gamification");
 const aiRoutes = require("./routes/ai");
 const paymentRoutes = require("./routes/payments");
 const virtualLabResourceRoutes = require("./routes/virtualLabResources");
+const uploadRoutes = require("./routes/uploads");
 const connectMongoDatabase = require("./config/database");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 
@@ -27,6 +30,8 @@ app.get("/health", (_req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
+app.use("/api/teachers", teacherRoutes);
+app.use("/api/admins", adminRoutes);
 app.use("/api/schools", schoolRoutes);
 app.use("/api/classes", classRoutes);
 app.use("/api/textbooks", textbookRoutes);
@@ -36,6 +41,7 @@ app.use("/api/gamification", gamificationRoutes);
 app.use("/api/ai", aiRoutes);
 app.use("/api/payments", paymentRoutes);
 app.use("/api/virtual-lab-resources", virtualLabResourceRoutes);
+app.use("/api/uploads", uploadRoutes);
 app.use(notFound);
 app.use(errorHandler);
 
