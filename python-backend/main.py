@@ -199,6 +199,8 @@ SOURCE_METADATA_KEYS = (
 client = None
 embedding_func = None
 available_collections_cache = None
+TEXTBOOK_ROWS_CACHE_TTL_SECONDS = 180
+textbook_rows_cache: dict[str, dict] = {}
 
 
 class StudentProfile(BaseModel):
@@ -266,6 +268,12 @@ class TextbookResourcesRequest(BaseModel):
     subject: str = "physics"
     grade: str = DEFAULT_GRADE
     chapter: Optional[str] = None
+    unit: Optional[str] = None
+
+
+class TextbookPreloadRequest(BaseModel):
+    subject: str = "physics"
+    grade: str = DEFAULT_GRADE
     unit: Optional[str] = None
 
 
@@ -485,6 +493,31 @@ def first_non_empty(metadata: dict, keys: tuple[str, ...]):
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def textbook_cache_key(subject: str, grade: str, unit: Optional[str] = None):
+    normalized_subject = normalize_subject_name(subject) or "physics"
+    normalized_grade = normalize_grade_value(grade)
+    normalized_unit = normalize_grounded_answer(unit or "").lower()
+    return f"{normalized_subject}:{normalized_grade}:{normalized_unit}"
+
+
+def get_warmed_collection_rows(subject: str, grade: str, unit: Optional[str] = None):
+    key = textbook_cache_key(subject, grade, unit)
+    now = time.time()
+    cached = textbook_rows_cache.get(key)
+
+    print(f"Searching ChromaDB for {subject} Grade {grade}...")
+
+    if cached and (now - cached.get("created_at", 0) < TEXTBOOK_ROWS_CACHE_TTL_SECONDS):
+        return cached.get("rows", [])
+
+    rows = collection_rows(subject, grade, unit)
+    textbook_rows_cache[key] = {
+        "rows": rows,
+        "created_at": now,
+    }
+    return rows
 
 
 def collection_rows(subject: str, grade: str, unit: Optional[str] = None):
@@ -1930,7 +1963,7 @@ def textbook_info():
 def textbook_resources(req: TextbookResourcesRequest):
     normalized_subject = normalize_subject_name(req.subject) or "physics"
     normalized_grade = normalize_grade_value(req.grade)
-    rows = collection_rows(normalized_subject, normalized_grade, req.unit)
+    rows = get_warmed_collection_rows(normalized_subject, normalized_grade, req.unit)
     resources = extract_textbook_resources(rows)
     return {
         "subject": normalized_subject,
@@ -1940,11 +1973,24 @@ def textbook_resources(req: TextbookResourcesRequest):
     }
 
 
+@app.post("/textbook/preload")
+def textbook_preload(req: TextbookPreloadRequest):
+    normalized_subject = normalize_subject_name(req.subject) or "physics"
+    normalized_grade = normalize_grade_value(req.grade)
+    rows = get_warmed_collection_rows(normalized_subject, normalized_grade, req.unit)
+    return {
+        "subject": normalized_subject,
+        "grade": normalized_grade,
+        "cached_rows": len(rows),
+        "message": "Textbook context warmed.",
+    }
+
+
 @app.post("/textbook/assist")
 def textbook_assist(req: TextbookAssistRequest):
     normalized_subject = normalize_subject_name(req.subject) or "physics"
     normalized_grade = normalize_grade_value(req.grade)
-    rows = collection_rows(normalized_subject, normalized_grade, req.unit)
+    rows = get_warmed_collection_rows(normalized_subject, normalized_grade, req.unit)
     canvas = find_canvas_for_page(rows, req.current_page)
     ar_hint = find_ar_for_page(rows, req.current_page)
 
@@ -1959,8 +2005,8 @@ def textbook_assist(req: TextbookAssistRequest):
 @app.post("/textbook/selection-ask")
 def textbook_selection_ask(req: TextSelectionAskRequest):
     selected_text = normalize_grounded_answer(req.selected_text)
-    # Large highlighted passages can overflow model context and look like retrieval failure.
-    selected_text_excerpt = selected_text[:1800] if selected_text else ""
+    # Large highlighted passages can overflow model context and slow the response.
+    selected_text_excerpt = selected_text[:1200] if selected_text else ""
     question = normalize_grounded_answer(req.question)
     subject = normalize_subject_name(req.subject) or "physics"
     grade = normalize_grade_value(req.grade)
@@ -1988,33 +2034,40 @@ def textbook_selection_ask(req: TextSelectionAskRequest):
             "message": "Question is required.",
         }
 
-    rows = collection_rows(subject, grade, req.unit)
-    query_text = f"{question} {selected_text_excerpt}".strip() or question
-    if req.current_page is not None and req.current_page > 0:
-        page_rows = [row for row in rows if metadata_page(row.get("metadata", {})) == req.current_page]
-        rows_for_rank = page_rows or rows
-    else:
-        rows_for_rank = rows
+    warmed_rows = get_warmed_collection_rows(subject, grade, req.unit)
 
-    ranked = rank_rows(query_text, rows_for_rank)
-    ranked_context_text = "\n\n".join(row.get("document", "") for row in ranked[:TOP_K]).strip()
     retrieval_result = None
     teacher_guide_context = ""
-    textbook_context = ranked_context_text
+    textbook_context = ""
 
-    if not ranked:
-        retrieval_result, error_message = fetch_textbook_context(query_text, grade, subject)
-        if error_message:
-            return {
-                "response": POLITE_INSUFFICIENT_INFO_MESSAGE,
-                "selected_text": selected_text,
-                "current_page": req.current_page,
-                "subject": subject,
-                "grade": grade,
-                "message": error_message,
-            }
-        textbook_context = str(retrieval_result.get("textbook_context_text", "") or "").strip()
-        teacher_guide_context = str(retrieval_result.get("teacher_guide_context_text", "") or "").strip()
+    if selected_text_excerpt:
+        textbook_context = f"Selected text excerpt:\n{selected_text_excerpt}".strip()
+    else:
+        rows = warmed_rows
+        query_text = question
+        if req.current_page is not None and req.current_page > 0:
+            page_rows = [row for row in rows if metadata_page(row.get("metadata", {})) == req.current_page]
+            rows_for_rank = page_rows or rows
+        else:
+            rows_for_rank = rows
+
+        ranked = rank_rows(query_text, rows_for_rank)
+        ranked_context_text = "\n\n".join(row.get("document", "") for row in ranked[:TOP_K]).strip()
+        textbook_context = ranked_context_text
+
+        if not ranked:
+            retrieval_result, error_message = fetch_textbook_context(query_text, grade, subject)
+            if error_message:
+                return {
+                    "response": POLITE_INSUFFICIENT_INFO_MESSAGE,
+                    "selected_text": selected_text,
+                    "current_page": req.current_page,
+                    "subject": subject,
+                    "grade": grade,
+                    "message": error_message,
+                }
+            textbook_context = str(retrieval_result.get("textbook_context_text", "") or "").strip()
+            teacher_guide_context = str(retrieval_result.get("teacher_guide_context_text", "") or "").strip()
 
     performance_band = normalize_grounded_answer(req.performance_band or "")
 

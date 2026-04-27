@@ -7,6 +7,7 @@ const {
   AdminProfile,
   TwinProfile,
   Subscription,
+  School,
 } = require("../models");
 const { uploadImageBuffer } = require("../services/cloudinaryService");
 
@@ -19,6 +20,34 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+const normalizeSubject = (subject) => {
+  const value = String(subject || "").trim().toLowerCase();
+  if (["biology", "chemistry", "physics", "math"].includes(value)) {
+    return value;
+  }
+  return null;
+};
+
+const normalizeSubjectList = (items) => {
+  if (!Array.isArray(items)) return [];
+  return items.map((item) => normalizeSubject(item)).filter(Boolean);
+};
+
+const sanitizeTwinSubjects = ({ strong = [], support = [] }) => {
+  const strongSet = new Set(normalizeSubjectList(strong));
+  const supportSet = new Set(normalizeSubjectList(support));
+
+  // Keep strong subjects authoritative when overlap happens.
+  for (const item of strongSet) {
+    supportSet.delete(item);
+  }
+
+  return {
+    strong_subjects: Array.from(strongSet),
+    support_subjects: Array.from(supportSet),
+  };
+};
 
 const getSubscriptionSnapshot = async (userId) => {
   const now = new Date();
@@ -54,13 +83,130 @@ const getUsers = async (_req, res) => {
       .sort({ created_at: -1 });
     return res.status(200).json({ success: true, data: users });
   } catch (error) {
-    return res
-      .status(500)
-      .json({
-        success: false,
-        message: "Failed to fetch users",
-        error: error.message,
-      });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch users",
+      error: error.message,
+    });
+  }
+};
+
+const getSubscriptionStats = async (_req, res) => {
+  try {
+    const students = await User.find({ role: "STUDENT" })
+      .select("_id email created_at")
+      .sort({ created_at: -1 });
+
+    const studentIds = students.map((student) => student._id);
+
+    const profiles = await StudentProfile.find({ user_id: { $in: studentIds } })
+      .select("user_id full_name grade_level section school_id")
+      .lean();
+
+    const profileMap = new Map(
+      profiles.map((profile) => [String(profile.user_id), profile]),
+    );
+
+    const schoolIds = [
+      ...new Set(
+        profiles
+          .map((profile) => profile.school_id)
+          .filter((schoolId) => !!schoolId)
+          .map((schoolId) => String(schoolId)),
+      ),
+    ];
+
+    const schools = schoolIds.length
+      ? await School.find({ _id: { $in: schoolIds } })
+          .select("_id name")
+          .lean()
+      : [];
+
+    const schoolMap = new Map(
+      schools.map((school) => [
+        String(school._id),
+        school.name || "Unknown School",
+      ]),
+    );
+
+    const now = new Date();
+    const activeSubscriptions = await Subscription.find({
+      user_id: { $in: studentIds },
+      status: "active",
+      current_period_end: { $gte: now },
+    })
+      .sort({ current_period_end: -1 })
+      .select("user_id plan_type status current_period_end")
+      .lean();
+
+    const subscriptionMap = new Map();
+    activeSubscriptions.forEach((subscription) => {
+      const userId = String(subscription.user_id);
+      if (!subscriptionMap.has(userId)) {
+        subscriptionMap.set(userId, subscription);
+      }
+    });
+
+    const data = students.map((student) => {
+      const profile = profileMap.get(String(student._id)) || null;
+      const subscription = subscriptionMap.get(String(student._id)) || null;
+      const schoolName = profile?.school_id
+        ? schoolMap.get(String(profile.school_id)) || "Unknown School"
+        : "Unknown School";
+      const fallbackName = String(student.email || "student")
+        .split("@")[0]
+        .replace(/[._-]+/g, " ")
+        .trim();
+
+      return {
+        key: String(student._id),
+        id: String(student._id),
+        fullName: profile?.full_name || fallbackName || "Student",
+        school: schoolName,
+        email: student.email,
+        grade: Number.isFinite(profile?.grade_level)
+          ? profile.grade_level
+          : null,
+        section: profile?.section || null,
+        paid: !!subscription,
+        plan: subscription?.plan_type || null,
+        subscriptionStatus: subscription?.status || null,
+        subscriptionPeriodEnd: subscription?.current_period_end || null,
+        createdAt: student.created_at || null,
+      };
+    });
+
+    const uniqueGrades = new Set(
+      data
+        .map((student) => student.grade)
+        .filter((grade) => Number.isFinite(grade)),
+    );
+    const uniqueSections = new Set(
+      data
+        .map((student) => student.section)
+        .filter((section) => typeof section === "string" && section.trim()),
+    );
+
+    const summary = {
+      totalStudents: data.length,
+      totalGrades: uniqueGrades.size,
+      totalSections: uniqueSections.size,
+      activeStudents: data.filter((student) => student.paid).length,
+    };
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        summary,
+        students: data,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch subscription stats",
+      error: error.message,
+    });
   }
 };
 
@@ -72,9 +218,26 @@ const getUserById = async (req, res) => {
         .status(400)
         .json({ success: false, message: "Invalid user id" });
 
-    const user = await User.findById(userId).select(
+    let lookupUserId = userId;
+    let user = await User.findById(lookupUserId).select(
       "_id email role created_at",
     );
+
+    // Safety fallback: some clients may accidentally pass a subscription _id
+    // instead of a user id. Resolve subscription.user_id and continue.
+    if (!user) {
+      const subscription = await Subscription.findById(userId)
+        .select("user_id")
+        .lean();
+
+      if (subscription?.user_id && isValidId(String(subscription.user_id))) {
+        lookupUserId = String(subscription.user_id);
+        user = await User.findById(lookupUserId).select(
+          "_id email role created_at",
+        );
+      }
+    }
+
     if (!user)
       return res
         .status(404)
@@ -87,17 +250,15 @@ const getUserById = async (req, res) => {
           ? await TeacherProfile.findOne({ user_id: user._id })
           : user.role === "ADMIN"
             ? await AdminProfile.findOne({ user_id: user._id })
-          : null;
+            : null;
 
     return res.status(200).json({ success: true, data: { user, profile } });
   } catch (error) {
-    return res
-      .status(500)
-      .json({
-        success: false,
-        message: "Failed to fetch user",
-        error: error.message,
-      });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch user",
+      error: error.message,
+    });
   }
 };
 
@@ -177,13 +338,11 @@ const getMe = async (req, res) => {
       },
     });
   } catch (error) {
-    return res
-      .status(500)
-      .json({
-        success: false,
-        message: "Failed to fetch profile",
-        error: error.message,
-      });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch profile",
+      error: error.message,
+    });
   }
 };
 
@@ -258,13 +417,14 @@ const updateMe = async (req, res) => {
           });
         }
 
-        const fileName = path
-          .parse(req.file.originalname || "student-photo")
-          .name.trim()
-          .toLowerCase()
-          .replace(/[^a-z0-9-_]/g, "-")
-          .replace(/-+/g, "-")
-          .replace(/^-|-$/g, "") || "student-photo";
+        const fileName =
+          path
+            .parse(req.file.originalname || "student-photo")
+            .name.trim()
+            .toLowerCase()
+            .replace(/[^a-z0-9-_]/g, "-")
+            .replace(/-+/g, "-")
+            .replace(/^-|-$/g, "") || "student-photo";
 
         const uploadResult = await uploadImageBuffer({
           buffer: req.file.buffer,
@@ -291,6 +451,10 @@ const updateMe = async (req, res) => {
         );
       }
 
+      const currentTwin = await TwinProfile.findOne({
+        student_id: studentProfile._id,
+      }).select("support_subjects strong_subjects");
+
       const twinUpdates = {};
       if (
         typeof req.body.mastery_score === "number" &&
@@ -304,11 +468,20 @@ const updateMe = async (req, res) => {
       ) {
         twinUpdates.performance_band = req.body.performance_band;
       }
-      if (Array.isArray(req.body.support_subjects)) {
-        twinUpdates.support_subjects = req.body.support_subjects;
-      }
-      if (Array.isArray(req.body.strong_subjects)) {
-        twinUpdates.strong_subjects = req.body.strong_subjects;
+      if (
+        Array.isArray(req.body.support_subjects) ||
+        Array.isArray(req.body.strong_subjects)
+      ) {
+        const sanitized = sanitizeTwinSubjects({
+          support: Array.isArray(req.body.support_subjects)
+            ? req.body.support_subjects
+            : currentTwin?.support_subjects || [],
+          strong: Array.isArray(req.body.strong_subjects)
+            ? req.body.strong_subjects
+            : currentTwin?.strong_subjects || [],
+        });
+        twinUpdates.support_subjects = sanitized.support_subjects;
+        twinUpdates.strong_subjects = sanitized.strong_subjects;
       }
       if (typeof req.body.twin_name === "string") {
         const normalizedTwinName = req.body.twin_name.trim();
@@ -393,7 +566,8 @@ const updateMe = async (req, res) => {
             is_subscribed: subscriptionSnapshot.is_subscribed,
             subscription_plan: subscriptionSnapshot.subscription_plan,
             subscription_status: subscriptionSnapshot.subscription_status,
-            subscription_period_end: subscriptionSnapshot.subscription_period_end,
+            subscription_period_end:
+              subscriptionSnapshot.subscription_period_end,
           },
         },
       });
@@ -519,13 +693,11 @@ const updateUser = async (req, res) => {
       .status(200)
       .json({ success: true, message: "User updated", data: user });
   } catch (error) {
-    return res
-      .status(500)
-      .json({
-        success: false,
-        message: "Failed to update user",
-        error: error.message,
-      });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update user",
+      error: error.message,
+    });
   }
 };
 
@@ -550,18 +722,17 @@ const deleteUser = async (req, res) => {
 
     return res.status(200).json({ success: true, message: "User deleted" });
   } catch (error) {
-    return res
-      .status(500)
-      .json({
-        success: false,
-        message: "Failed to delete user",
-        error: error.message,
-      });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete user",
+      error: error.message,
+    });
   }
 };
 
 module.exports = {
   getUsers,
+  getSubscriptionStats,
   getMe,
   updateMe,
   getUserById,

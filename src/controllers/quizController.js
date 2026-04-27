@@ -110,6 +110,61 @@ const normalizeComparableText = (value = "") =>
 		.replace(/\s+/g, " ")
 		.trim();
 
+const resolveMcqCorrectAnswer = (rawAnswer, options = []) => {
+	const answer = String(rawAnswer || "").trim();
+	if (!answer || !Array.isArray(options) || options.length === 0) {
+		return answer;
+	}
+
+	const directNumber = answer.match(/^\s*(\d+)\s*$/);
+	if (directNumber) {
+		const parsed = Number(directNumber[1]);
+		const oneBased = parsed - 1;
+		if (oneBased >= 0 && oneBased < options.length) {
+			return options[oneBased];
+		}
+		if (parsed >= 0 && parsed < options.length) {
+			return options[parsed];
+		}
+	}
+
+	const leadingLetter = answer.match(/^\s*\(?([a-zA-Z])\)?[\].:\-]?\s*$/);
+	if (leadingLetter) {
+		const idx = leadingLetter[1].toUpperCase().charCodeAt(0) - 65;
+		if (idx >= 0 && idx < options.length) {
+			return options[idx];
+		}
+	}
+
+	const optionWord = answer
+		.toLowerCase()
+		.match(/\b(option|choice)\s+([a-z]|\d+)\b/);
+	if (optionWord) {
+		const marker = optionWord[2];
+		if (/^\d+$/.test(marker)) {
+			const idx = Number(marker) - 1;
+			if (idx >= 0 && idx < options.length) {
+				return options[idx];
+			}
+		} else {
+			const idx = marker.toUpperCase().charCodeAt(0) - 65;
+			if (idx >= 0 && idx < options.length) {
+				return options[idx];
+			}
+		}
+	}
+
+	const normalizedAnswer = normalizeComparableText(answer);
+	const exactText = options.find(
+		(option) => normalizeComparableText(option) === normalizedAnswer
+	);
+	if (exactText) {
+		return exactText;
+	}
+
+	return answer;
+};
+
 const persistQuizWithQuestions = async (quizPayload, normalizedQuestions) => {
 	let quiz = null;
 	let createdQuestions = [];
@@ -397,11 +452,16 @@ const generateAiPracticeQuiz = async (req, res) => {
 						options = [];
 					}
 
+					const resolvedCorrectAnswer =
+						questionType === "MCQ"
+							? resolveMcqCorrectAnswer(correctAnswer, options)
+							: correctAnswer;
+
 					return {
 						question_type: questionType,
 						question_text: questionText,
 						options,
-						correct_answer: correctAnswer,
+						correct_answer: resolvedCorrectAnswer,
 						explanation: explanationText,
 						points: 1,
 						order_index: index + 1,

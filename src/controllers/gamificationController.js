@@ -33,6 +33,20 @@ const normalizeSubjectList = (items) => {
 		.filter(Boolean);
 };
 
+const sanitizeTwinSubjects = ({ strong = [], support = [] }) => {
+	const strongSet = new Set(normalizeSubjectList(strong));
+	const supportSet = new Set(normalizeSubjectList(support));
+
+	for (const item of strongSet) {
+		supportSet.delete(item);
+	}
+
+	return {
+		strong_subjects: Array.from(strongSet),
+		support_subjects: Array.from(supportSet),
+	};
+};
+
 const ensureTwinProfile = async (studentId, updates = {}) => {
 	let twinProfile = await TwinProfile.findOne({ student_id: studentId });
 	if (!twinProfile) {
@@ -117,6 +131,10 @@ const applyTwinUpdate = async (twinProfile, payload = {}) => {
 			lastActiveKey === getYesterdayKey(todayKey)
 				? Number(twinProfile.streak || 0) + 1
 				: 1;
+	} else if (Number(twinProfile.streak || 0) <= 0) {
+		// Newly created profiles may have last_active=today from schema default.
+		// Treat the first real activity as day 1 of streak.
+		twinProfile.streak = 1;
 	}
 
 	const subject = normalizeSubject(payload.subject);
@@ -236,8 +254,18 @@ const updateTwinProgress = async (req, res) => {
 		if (streak !== undefined) twinProfile.streak = Number(streak);
 		if (mastery_percentage !== undefined) twinProfile.mastery_percentage = Number(mastery_percentage);
 		if (performance_band) twinProfile.performance_band = performance_band;
-		if (Array.isArray(support_subjects)) twinProfile.support_subjects = support_subjects;
-		if (Array.isArray(strong_subjects)) twinProfile.strong_subjects = strong_subjects;
+		if (Array.isArray(support_subjects) || Array.isArray(strong_subjects)) {
+			const sanitized = sanitizeTwinSubjects({
+				support: Array.isArray(support_subjects)
+					? support_subjects
+					: twinProfile.support_subjects,
+				strong: Array.isArray(strong_subjects)
+					? strong_subjects
+					: twinProfile.strong_subjects,
+			});
+			twinProfile.support_subjects = sanitized.support_subjects;
+			twinProfile.strong_subjects = sanitized.strong_subjects;
+		}
 		if (req.body && typeof req.body.subject_scores === "object") twinProfile.subject_scores = req.body.subject_scores;
 		twinProfile.last_active = new Date();
 

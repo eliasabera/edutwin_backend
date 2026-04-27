@@ -2,15 +2,16 @@ const express = require("express");
 const auth = require("../middleware/auth");
 const roleCheck = require("../middleware/roleCheck");
 const {
-	createSchool,
-	getSchools,
-	getSchoolById,
-	updateSchool,
-	deleteSchool,
+  createSchool,
+  getSchools,
+  getSchoolById,
+  updateSchool,
+  deleteSchool,
 } = require("../controllers/schoolController");
 
 const router = express.Router();
 
+router.get("/public", getSchools);
 router.get("/", auth, getSchools);
 router.get("/:schoolId", auth, getSchoolById);
 router.post("/", auth, roleCheck("ADMIN"), createSchool);

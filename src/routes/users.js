@@ -4,6 +4,7 @@ const auth = require("../middleware/auth");
 const roleCheck = require("../middleware/roleCheck");
 const {
   getUsers,
+  getSubscriptionStats,
   getMe,
   updateMe,
   getUserById,
@@ -23,6 +24,12 @@ router.get("/me", auth, getMe);
 router.patch("/me", auth, upload.single("student_photo"), updateMe);
 router.put("/me", auth, upload.single("student_photo"), updateMe);
 router.get("/", auth, roleCheck("ADMIN", "TEACHER"), getUsers);
+router.get(
+  "/subscription-stats",
+  auth,
+  roleCheck("ADMIN"),
+  getSubscriptionStats,
+);
 router.get("/:userId", auth, roleCheck("ADMIN", "TEACHER"), getUserById);
 router.put("/:userId", auth, roleCheck("ADMIN"), updateUser);
 router.delete("/:userId", auth, roleCheck("ADMIN"), deleteUser);
